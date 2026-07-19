@@ -21,7 +21,12 @@ KEEP_COLS = [
 
 
 def ola_dir(base: Path | None = None) -> Path:
-    root = Path(base) if base else Path(__file__).resolve().parents[1]
+    if base is not None:
+        root = Path(base)
+    else:
+        from lib.paths import data_root
+
+        root = data_root()
     # Prefer OLA; fall back to Ola
     for name in ("OLA", "Ola", "ola"):
         path = root / name

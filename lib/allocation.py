@@ -22,8 +22,11 @@ ALLOC_COLS = [
 
 
 def allocation_dir(base: Path | None = None) -> Path:
-    root = Path(base) if base else Path(__file__).resolve().parents[1]
-    return root / "Vehicle Allocation Status"
+    if base is not None:
+        return Path(base)
+    from lib.paths import data_root
+
+    return data_root() / "Vehicle Allocation Status"
 
 
 def _norm_vehicle(value) -> str:

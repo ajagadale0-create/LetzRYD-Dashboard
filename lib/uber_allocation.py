@@ -9,6 +9,7 @@ import pandas as pd
 from lib.allocation import _norm_partner_id, load_allocation
 from lib.ola_process import build_ola_vehicle_days, ola_dir
 from lib.gps_process import build_gps_vehicle_days, gps_dir
+from lib.rapido_process import build_rapido_vehicle_days, rapido_dir
 from lib.uber_process import build_uber_vehicle_days
 
 TABLE_COLS = [
@@ -37,8 +38,11 @@ TABLE_COLS = [
     "Cash Collection",
     "Ola Customer Bill",
     "Ola Cash Collected",
+    "Rapido Revenue",
+    "Rapido Ride Time",
     "Trip Completed Count",
     "Ola Trips",
+    "Rapido Trips",
     "Trip Distance",
     "Ola Actual Kms",
     "Ola Trip Time",
@@ -99,16 +103,24 @@ def run_on_daily_counts(
     end_date: str | None = None,
     alloc: pd.DataFrame | None = None,
     city: str | None = None,
+    rapido_days: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
-    Unique vehicle counts per day by Run On: OLA / Uber / OLA+Uber.
+    Unique vehicle counts per day by Run On: OLA / Uber / Rapido / Mix.
+    Mix = active on 2+ platforms the same day.
     Fixed window of last_n_days ending at end_date (or max activity date).
     Optional city filter uses allocation City on that day.
     """
     empty = pd.DataFrame(columns=["Date", "Run On", "Vehicles"])
+    categories = ["OLA", "Uber", "Rapido", "Mix"]
 
     uber = uber_days.copy() if uber_days is not None and not uber_days.empty else pd.DataFrame()
     ola = ola_days.copy() if ola_days is not None and not ola_days.empty else pd.DataFrame()
+    rapido = (
+        rapido_days.copy()
+        if rapido_days is not None and not rapido_days.empty
+        else pd.DataFrame()
+    )
 
     if not uber.empty:
         uber_active = uber[
@@ -126,14 +138,22 @@ def run_on_daily_counts(
     else:
         ola_active = pd.DataFrame(columns=["Vehicle Number", "Date", "_ola"])
 
-    if uber_active.empty and ola_active.empty:
+    if not rapido.empty:
+        rapido_active = rapido[
+            (rapido["Rapido Trips"] > 0) | (rapido["Rapido Revenue"] != 0)
+        ][["Vehicle Number", "Date"]].drop_duplicates()
+        rapido_active["_rapido"] = True
+    else:
+        rapido_active = pd.DataFrame(columns=["Vehicle Number", "Date", "_rapido"])
+
+    if uber_active.empty and ola_active.empty and rapido_active.empty:
         return empty
 
-    merged = pd.merge(
-        uber_active, ola_active, on=["Vehicle Number", "Date"], how="outer"
-    )
+    merged = uber_active.merge(ola_active, on=["Vehicle Number", "Date"], how="outer")
+    merged = merged.merge(rapido_active, on=["Vehicle Number", "Date"], how="outer")
     merged["_uber"] = merged["_uber"].fillna(False).astype(bool)
     merged["_ola"] = merged["_ola"].fillna(False).astype(bool)
+    merged["_rapido"] = merged["_rapido"].fillna(False).astype(bool)
     merged["Date"] = pd.to_datetime(merged["Date"], errors="coerce").dt.normalize()
     merged = merged[merged["Date"].notna()].copy()
 
@@ -161,9 +181,7 @@ def run_on_daily_counts(
         city_days["Date"] = pd.to_datetime(city_days["Date"], errors="coerce").dt.normalize()
         merged = merged.merge(city_days, on=["Vehicle Number", "Date"], how="inner")
         if merged.empty:
-            # still return zero grid for the window
             all_days = pd.date_range(start, end, freq="D")
-            categories = ["OLA", "Uber", "OLA+Uber"]
             grid = pd.MultiIndex.from_product(
                 [all_days, categories], names=["Date", "Run On"]
             ).to_frame(index=False)
@@ -171,11 +189,19 @@ def run_on_daily_counts(
             grid["Date"] = grid["Date"].dt.strftime("%Y-%m-%d")
             return grid.reset_index(drop=True)
 
-    run_on = pd.Series("", index=merged.index, dtype=object)
-    run_on.loc[merged["_uber"] & ~merged["_ola"]] = "Uber"
-    run_on.loc[merged["_ola"] & ~merged["_uber"]] = "OLA"
-    run_on.loc[merged["_uber"] & merged["_ola"]] = "OLA+Uber"
-    merged["Run On"] = run_on
+    def _label(row) -> str:
+        n = int(row["_ola"]) + int(row["_uber"]) + int(row["_rapido"])
+        if n >= 2:
+            return "Mix"
+        if row["_ola"]:
+            return "OLA"
+        if row["_uber"]:
+            return "Uber"
+        if row["_rapido"]:
+            return "Rapido"
+        return ""
+
+    merged["Run On"] = merged.apply(_label, axis=1)
     merged = merged[merged["Run On"] != ""].copy()
 
     daily = (
@@ -185,7 +211,6 @@ def run_on_daily_counts(
     )
 
     all_days = pd.date_range(start, end, freq="D")
-    categories = ["OLA", "Uber", "OLA+Uber"]
     grid = pd.MultiIndex.from_product(
         [all_days, categories], names=["Date", "Run On"]
     ).to_frame(index=False)
@@ -473,6 +498,7 @@ def assemble_fleet_table(
     uber_days: pd.DataFrame,
     ola_days: pd.DataFrame,
     gps_days: pd.DataFrame | None = None,
+    rapido_days: pd.DataFrame | None = None,
     *,
     write_output: bool = False,
     uber_base: Path | None = None,
@@ -590,10 +616,17 @@ def assemble_fleet_table(
         end,
         ["GPS KMs"],
     )
+    rapido_summary = _agg_metric_days(
+        rapido_days if rapido_days is not None else pd.DataFrame(),
+        start,
+        end,
+        ["Rapido Revenue", "Rapido Ride Time", "Rapido Trips"],
+    )
 
     joined = lookup.merge(summary, on="Vehicle Number", how="left")
     joined = joined.merge(ola_summary, on="Vehicle Number", how="left")
     joined = joined.merge(gps_summary, on="Vehicle Number", how="left")
+    joined = joined.merge(rapido_summary, on="Vehicle Number", how="left")
 
     for col in (
         "Revenue",
@@ -606,6 +639,9 @@ def assemble_fleet_table(
         "Ola Trip Time",
         "Ola Trips",
         "GPS KMs",
+        "Rapido Revenue",
+        "Rapido Ride Time",
+        "Rapido Trips",
     ):
         if col not in joined.columns:
             joined[col] = 0
@@ -626,6 +662,7 @@ def assemble_fleet_table(
 
     joined["Trip Completed Count"] = joined["Trip Completed Count"].astype(int)
     joined["Ola Trips"] = joined["Ola Trips"].astype(int)
+    joined["Rapido Trips"] = joined["Rapido Trips"].astype(int)
     joined["Ola Trip Time"] = joined["Ola Trip Time"].round(0).astype(int)
     joined["Revenue"] = joined["Revenue"].round(2)
     joined["Cash Collection"] = joined["Cash Collection"].round(2)
@@ -634,14 +671,16 @@ def assemble_fleet_table(
     joined["Ola Cash Collected"] = joined["Ola Cash Collected"].round(2)
     joined["Ola Actual Kms"] = joined["Ola Actual Kms"].round(2)
     joined["GPS KMs"] = joined["GPS KMs"].round(2)
+    joined["Rapido Revenue"] = joined["Rapido Revenue"].round(2)
+    joined["Rapido Ride Time"] = joined["Rapido Ride Time"].round(2)
     joined["Total Revenue"] = (
-        joined["Revenue"] + joined["Ola Customer Bill"]
+        joined["Revenue"] + joined["Ola Customer Bill"] + joined["Rapido Revenue"]
     ).round(2)
     joined["Total Cash Collection"] = (
         joined["Cash Collection"] + joined["Ola Cash Collected"]
     ).round(2)
     joined["Total Trip"] = (
-        joined["Trip Completed Count"] + joined["Ola Trips"]
+        joined["Trip Completed Count"] + joined["Ola Trips"] + joined["Rapido Trips"]
     ).astype(int)
     joined["Total Intrip KM"] = (
         joined["Trip Distance"] + joined["Ola Actual Kms"]
@@ -667,10 +706,24 @@ def assemble_fleet_table(
 
     uber_on = (joined["Trip Completed Count"] > 0) | (joined["Revenue"] != 0)
     ola_on = (joined["Ola Trips"] > 0) | (joined["Ola Customer Bill"] != 0)
-    joined["Run On"] = ""
-    joined.loc[uber_on & ~ola_on, "Run On"] = "Uber"
-    joined.loc[ola_on & ~uber_on, "Run On"] = "OLA"
-    joined.loc[uber_on & ola_on, "Run On"] = "OLA+Uber"
+    rapido_on = (joined["Rapido Trips"] > 0) | (joined["Rapido Revenue"] != 0)
+
+    def _run_on_label(u: bool, o: bool, r: bool) -> str:
+        n = int(u) + int(o) + int(r)
+        if n >= 2:
+            return "Mix"
+        if o:
+            return "OLA"
+        if u:
+            return "Uber"
+        if r:
+            return "Rapido"
+        return ""
+
+    joined["Run On"] = [
+        _run_on_label(bool(u), bool(o), bool(r))
+        for u, o, r in zip(uber_on.tolist(), ola_on.tolist(), rapido_on.tolist())
+    ]
 
     joined["Ageing"] = _assign_ageing(joined["Partner ID"], joined["Total Revenue"])
 
@@ -715,10 +768,15 @@ def assemble_fleet_table(
         )
         if len(joined)
         else 0,
+        "with_rapido": int(
+            ((joined["Rapido Trips"] > 0) | (joined["Rapido Revenue"] != 0)).sum()
+        )
+        if len(joined)
+        else 0,
         "with_gps": int((joined["GPS KMs"] > 0).sum()) if len(joined) else 0,
         "output_path": out_path,
         "needs_current_export": day_rows == 0,
-        "base": "allocation_vehicles_then_uber_ola_gps",
+        "base": "allocation_vehicles_then_uber_ola_rapido_gps",
     }
     return joined, meta
 
@@ -733,7 +791,7 @@ def build_uber_range_with_allocation(
     """
     Base = Excel vehicles that appear on any day in [start_date, end_date].
     Partner fields = last exact-day row in that range per vehicle.
-    Uber/Ola metrics = summed across the range for those vehicles.
+    Uber/Ola/Rapido metrics = summed across the range for those vehicles.
     """
     root = Path(project_root) if project_root else Path(__file__).resolve().parents[1]
     uber_base = root / "Uber"
@@ -743,6 +801,7 @@ def build_uber_range_with_allocation(
     uber_days, _ = build_uber_vehicle_days(uber_base)
     ola_days, _ = build_ola_vehicle_days(ola_dir(root))
     gps_days, _ = build_gps_vehicle_days(gps_dir(root))
+    rapido_days, _ = build_rapido_vehicle_days(rapido_dir(root))
     return assemble_fleet_table(
         start_date,
         end_date,
@@ -751,6 +810,7 @@ def build_uber_range_with_allocation(
         uber_days,
         ola_days,
         gps_days,
+        rapido_days,
         write_output=write_output,
         uber_base=uber_base,
     )

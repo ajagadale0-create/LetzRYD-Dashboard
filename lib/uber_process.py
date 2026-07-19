@@ -125,7 +125,11 @@ def load_uber_paths(base: Path | None = None) -> tuple[Path, Path]:
 
 
 def uber_root(base: Path | None = None) -> Path:
-    return Path(base) if base else Path(__file__).resolve().parents[1] / "Uber"
+    if base is not None:
+        return Path(base)
+    from lib.paths import data_root
+
+    return data_root() / "Uber"
 
 
 def assign_vehicle_numbers(pt: pd.DataFrame, trip: pd.DataFrame) -> pd.DataFrame:

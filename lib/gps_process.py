@@ -10,7 +10,12 @@ from lib.allocation import _norm_vehicle
 
 
 def gps_dir(base: Path | None = None) -> Path:
-    root = Path(base) if base else Path(__file__).resolve().parents[1]
+    if base is not None:
+        root = Path(base)
+    else:
+        from lib.paths import data_root
+
+        root = data_root()
     for name in ("GPS", "Gps", "gps"):
         path = root / name
         if path.is_dir():

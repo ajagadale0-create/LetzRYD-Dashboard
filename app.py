@@ -39,6 +39,13 @@ from lib.gps_process import (
     gps_dir,
     list_gps_files,
 )
+from lib.rapido_process import (
+    build_rapido_vehicle_days,
+    list_rapido_files,
+    rapido_dir,
+)
+from lib.drive_sync import drive_configured, ensure_data_ready
+from lib.paths import data_root
 import plotly.express as px
 
 
@@ -107,13 +114,15 @@ def _file_sig(path: Path) -> str:
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v20-deadmile-floor", source_fingerprint(uber_root())]
+    parts = ["v26-run-on-mix", source_fingerprint(uber_root())]
     for path in list_allocation_files(allocation_dir()):
         parts.append(f"alloc:{_file_sig(path)}")
     for path in list_ola_files():
         parts.append(f"ola:{_file_sig(path)}")
     for path in list_gps_files():
         parts.append(f"gps:{_file_sig(path)}")
+    for path in list_rapido_files():
+        parts.append(f"rapido:{_file_sig(path)}")
     return "|".join(parts)
 
 
@@ -139,6 +148,12 @@ def cached_ola_days(fingerprint: str):
 def cached_gps_days(fingerprint: str):
     _ = fingerprint
     return build_gps_vehicle_days(gps_dir())
+
+
+@st.cache_data(show_spinner="Loading Rapido metrics…", ttl=3600)
+def cached_rapido_days(fingerprint: str):
+    _ = fingerprint
+    return build_rapido_vehicle_days(rapido_dir())
 
 
 @st.cache_data(show_spinner="Reading available dates…", ttl=3600)
@@ -167,6 +182,14 @@ def load_available_dates(fingerprint: str) -> list[str]:
             )
     except Exception:
         pass
+    try:
+        rapido_days, _ = cached_rapido_days(fingerprint)
+        if not rapido_days.empty:
+            dates.update(
+                rapido_days["Date"].dt.strftime("%Y-%m-%d").dropna().unique().tolist()
+            )
+    except Exception:
+        pass
     return sorted(dates)
 
 
@@ -174,6 +197,7 @@ def load_available_dates(fingerprint: str) -> list[str]:
 def load_run_on_trend(fingerprint: str, city: str = "All cities") -> pd.DataFrame:
     uber_days, _ = cached_uber_days(fingerprint)
     ola_days, _ = cached_ola_days(fingerprint)
+    rapido_days, _ = cached_rapido_days(fingerprint)
     alloc, _ = cached_allocation(fingerprint)
     return run_on_daily_counts(
         uber_days,
@@ -181,6 +205,7 @@ def load_run_on_trend(fingerprint: str, city: str = "All cities") -> pd.DataFram
         last_n_days=7,
         alloc=alloc,
         city=None if city == "All cities" else city,
+        rapido_days=rapido_days,
     )
 
 
@@ -222,6 +247,7 @@ def load_range_table(start_date: str, end_date: str, fingerprint: str):
     uber_days, _ = cached_uber_days(fingerprint)
     ola_days, _ = cached_ola_days(fingerprint)
     gps_days, _ = cached_gps_days(fingerprint)
+    rapido_days, _ = cached_rapido_days(fingerprint)
     return assemble_fleet_table(
         start_date,
         end_date,
@@ -230,8 +256,19 @@ def load_range_table(start_date: str, end_date: str, fingerprint: str):
         uber_days,
         ola_days,
         gps_days,
+        rapido_days,
         write_output=False,
     )
+
+
+def _chart_day_label(value) -> str:
+    """Chart x-axis: 11-7 with weekday letter below (M T W T F S S)."""
+    ts = pd.to_datetime(value, errors="coerce")
+    if pd.isna(ts):
+        return str(value)
+    # Mon=0 … Sun=6
+    letters = ("M", "T", "W", "T", "F", "S", "S")
+    return f"{int(ts.day)}-{int(ts.month)}<br>{letters[int(ts.dayofweek)]}"
 
 
 def _line_chart_with_labels(
@@ -249,6 +286,7 @@ def _line_chart_with_labels(
     st.caption(caption)
 
     plot_df = trend.copy()
+    plot_df["Date"] = plot_df["Date"].map(_chart_day_label)
     # Hide 0 labels so they don't clutter; keep marker
     plot_df["_label"] = plot_df["Vehicles"].map(lambda v: "" if int(v) == 0 else str(int(v)))
 
@@ -261,7 +299,7 @@ def _line_chart_with_labels(
         text="_label",
         category_orders=category_orders,
         color_discrete_map=color_map,
-        labels={"Vehicles": "Vehicles", "Date": "Date", color_col: color_col},
+        labels={"Vehicles": "Vehicles", "Date": "", color_col: color_col},
     )
 
     # Label by line height: top & mid → above; lowest line → side
@@ -302,7 +340,7 @@ def _line_chart_with_labels(
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans", color="#1A2B24", size=11),
         legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0, font=dict(size=10)),
-        xaxis=dict(gridcolor="#DCE6E1", tickangle=-30),
+        xaxis=dict(gridcolor="#DCE6E1", tickangle=0, type="category", title=""),
         yaxis=dict(
             gridcolor="#DCE6E1",
             title="Vehicles",
@@ -315,18 +353,75 @@ def _line_chart_with_labels(
 
 
 def _render_run_on_chart(trend: pd.DataFrame) -> None:
-    _line_chart_with_labels(
-        trend,
-        color_col="Run On",
-        category_orders={"Run On": ["OLA", "Uber", "OLA+Uber"]},
-        color_map={
+    """One bar per day · OLA / Uber / Rapido / Mix stacked · visible labels."""
+    if trend.empty:
+        return
+    st.subheader("Run On")
+    st.caption("Last 7 days · one bar per day · OLA / Uber / Rapido / Mix stacked")
+
+    plot_df = trend.copy()
+    plot_df["Date"] = plot_df["Date"].map(_chart_day_label)
+    plot_df["_label"] = plot_df["Vehicles"].map(
+        lambda v: "" if int(v) == 0 else str(int(v))
+    )
+
+    fig = px.bar(
+        plot_df,
+        x="Date",
+        y="Vehicles",
+        color="Run On",
+        barmode="stack",
+        text="_label",
+        category_orders={"Run On": ["OLA", "Uber", "Rapido", "Mix"]},
+        color_discrete_map={
             "OLA": "#0F6E56",
             "Uber": "#1B4F9C",
-            "OLA+Uber": "#C45C26",
+            "Rapido": "#7A3E9D",
+            "Mix": "#C45C26",
         },
-        title="Run On",
-        caption="Last 7 days · OLA / Uber / OLA+Uber",
+        labels={"Vehicles": "Vehicles", "Date": "", "Run On": "Run On"},
     )
+    fig.update_traces(
+        textposition="inside",
+        insidetextanchor="middle",
+        cliponaxis=False,
+        textfont=dict(size=12, family="DM Sans", color="#FFFFFF"),
+        marker_line_width=0,
+        textangle=0,
+    )
+    # Day totals on top of each stacked bar
+    day_tot = (
+        plot_df.groupby("Date", as_index=False)["Vehicles"]
+        .sum()
+        .rename(columns={"Vehicles": "Total"})
+    )
+    y_max = float(day_tot["Total"].max()) if len(day_tot) else 0
+    fig.add_scatter(
+        x=day_tot["Date"],
+        y=day_tot["Total"],
+        mode="text",
+        text=day_tot["Total"].map(lambda v: str(int(v)) if int(v) else ""),
+        textposition="top center",
+        textfont=dict(size=13, family="DM Sans", color="#0B1F18"),
+        showlegend=False,
+        hoverinfo="skip",
+    )
+    fig.update_layout(
+        height=360,
+        margin=dict(l=10, r=20, t=55, b=10),
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(family="DM Sans", color="#1A2B24", size=11),
+        legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0, font=dict(size=11)),
+        xaxis=dict(gridcolor="#DCE6E1", tickangle=0, type="category", title=""),
+        yaxis=dict(
+            gridcolor="#DCE6E1",
+            title="Vehicles",
+            range=[0, y_max * 1.25 + 5],
+        ),
+        bargap=0.35,
+    )
+    st.plotly_chart(fig, use_container_width=True)
 
 
 def _render_ageing_chart(trend: pd.DataFrame) -> None:
@@ -353,6 +448,7 @@ def _render_revenue_deadmile_chart(trend: pd.DataFrame) -> None:
     )
 
     plot_df = trend.copy()
+    plot_df["Date"] = plot_df["Date"].map(_chart_day_label)
     plot_df["_label"] = plot_df["Amount"].map(
         lambda v: "" if abs(float(v)) < 0.5 else f"{float(v):,.0f}"
     )
@@ -372,7 +468,7 @@ def _render_revenue_deadmile_chart(trend: pd.DataFrame) -> None:
             "Unproductive": "#C45C26",
             "Deadmile": "#1B4F9C",
         },
-        labels={"Amount": "Amount", "Date": "Date", "Metric": "Metric"},
+        labels={"Amount": "Amount", "Date": "", "Metric": "Metric"},
     )
 
     def _trace_mean(trace) -> float:
@@ -412,7 +508,7 @@ def _render_revenue_deadmile_chart(trend: pd.DataFrame) -> None:
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans", color="#1A2B24", size=11),
         legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0, font=dict(size=10)),
-        xaxis=dict(gridcolor="#DCE6E1", tickangle=-30),
+        xaxis=dict(gridcolor="#DCE6E1", tickangle=0, type="category", title=""),
         yaxis=dict(
             gridcolor="#DCE6E1",
             title="Amount",
@@ -424,8 +520,173 @@ def _render_revenue_deadmile_chart(trend: pd.DataFrame) -> None:
     st.plotly_chart(fig, use_container_width=True)
 
 
+def _month_label(start_date: str, end_date: str) -> str:
+    try:
+        s = pd.Timestamp(start_date)
+        e = pd.Timestamp(end_date)
+    except Exception:
+        return f"{start_date} → {end_date}"
+    if s.strftime("%Y-%m") == e.strftime("%Y-%m"):
+        return s.strftime("%B %Y")
+    return f"{s.strftime('%d %b %Y')} → {e.strftime('%d %b %Y')}"
+
+
+def _current_month_range(available_dates: list[str]) -> tuple[str, str] | None:
+    """First/last available dates that fall in the current calendar month."""
+    if not available_dates:
+        return None
+    today = pd.Timestamp.today().normalize()
+    month_key = today.strftime("%Y-%m")
+    in_month = [d for d in available_dates if str(d).startswith(month_key)]
+    if not in_month:
+        return None
+    return in_month[0], in_month[-1]
+
+
+def _render_km_mix_pie(df: pd.DataFrame, *, period_label: str) -> None:
+    """Pie on left · full labels on right (Unproductive always listed)."""
+    st.subheader("KM mix")
+    st.caption(f"Current month (fixed) · {period_label}")
+
+    if df is None or df.empty:
+        st.info("No vehicles in this filter for the pie chart.")
+        return
+
+    needed = ("Total Intrip KM", "Approved KM", "Dead KM", "Dead KM Type")
+    if any(c not in df.columns for c in needed):
+        st.info("KM columns not ready yet — refresh data.")
+        return
+
+    dead = df["Dead KM"].fillna(0).clip(lower=0)
+    dtype = df["Dead KM Type"].fillna("").astype(str).str.strip()
+    deadmile_km = float(dead[dtype == "Deadmile"].sum())
+    unproductive_km = float(dead[dtype == "Unproductive"].sum())
+
+    colors = {
+        "Intrip KM": "#0F6E56",
+        "Approved KM": "#1B4F9C",
+        "Deadmile": "#C45C26",
+        "Unproductive": "#8B2942",
+    }
+    # Always keep all 4 rows so Unproductive never disappears from labels
+    pie_df = pd.DataFrame(
+        {
+            "Category": ["Intrip KM", "Approved KM", "Deadmile", "Unproductive"],
+            "KM": [
+                float(df["Total Intrip KM"].fillna(0).clip(lower=0).sum()),
+                float(df["Approved KM"].fillna(0).clip(lower=0).sum()),
+                deadmile_km,
+                unproductive_km,
+            ],
+        }
+    )
+    total = float(pie_df["KM"].clip(lower=0).sum())
+    if total <= 0:
+        st.info("No KM totals to chart for this period.")
+        return
+
+    pie_df["Pct"] = pie_df["KM"].clip(lower=0) / total
+    pie_df["Color"] = pie_df["Category"].map(colors)
+
+    # Chart data: still plot zeros as tiny so order stays stable — skip exact 0
+    chart_df = pie_df[pie_df["KM"] > 0].copy()
+    if chart_df.empty:
+        st.info("No KM totals to chart for this period.")
+        return
+
+    pie_col, label_col = st.columns([2.4, 0.85])
+    with pie_col:
+        pulls = [
+            0.18 if c == "Unproductive" else 0.02 for c in chart_df["Category"]
+        ]
+        text_pos = [
+            "outside" if c == "Unproductive" or float(p) < 0.08 else "inside"
+            for c, p in zip(chart_df["Category"], chart_df["Pct"])
+        ]
+        text_colors = [
+            "#1A2B24" if pos == "outside" else "#FFFFFF" for pos in text_pos
+        ]
+        fig = px.pie(
+            chart_df,
+            names="Category",
+            values="KM",
+            color="Category",
+            color_discrete_map=colors,
+            category_orders={
+                "Category": ["Intrip KM", "Approved KM", "Deadmile", "Unproductive"],
+            },
+            hole=0.4,
+        )
+        fig.update_traces(
+            textposition=text_pos,
+            textinfo="label+percent",
+            texttemplate="%{label}<br>%{percent:.1%}",
+            hovertemplate="<b>%{label}</b><br>%{value:,.0f} km<br>%{percent:.1%}<extra></extra>",
+            marker=dict(line=dict(color="#F7FAF8", width=3)),
+            insidetextorientation="horizontal",
+            pull=pulls,
+            showlegend=False,
+            sort=False,
+        )
+        if fig.data:
+            fig.data[0].textfont = dict(
+                size=12, family="DM Sans", color=text_colors
+            )
+        fig.update_layout(
+            height=380,
+            margin=dict(l=8, r=8, t=8, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+            annotations=[
+                dict(
+                    text=f"<b>{total:,.0f}</b><br>total km",
+                    x=0.5,
+                    y=0.5,
+                    showarrow=False,
+                    font=dict(size=14, family="DM Sans", color="#1A2B24"),
+                    align="center",
+                )
+            ],
+        )
+        st.plotly_chart(fig, use_container_width=True)
+
+    with label_col:
+        rows_html = []
+        for _, row in pie_df.iterrows():
+            highlight = row["Category"] == "Unproductive"
+            bg = "background:#F8ECEF;" if highlight else "background:#F4F8F6;"
+            rows_html.append(
+                f"""
+                <div style="
+                    {bg}
+                    border-radius:5px; padding:0.2rem 0.35rem; margin:0 0 0.2rem;
+                    font-family:'DM Sans',sans-serif;
+                    display:flex; align-items:center; gap:0.3rem;
+                ">
+                  <span style="
+                      width:7px; height:7px; border-radius:2px; flex-shrink:0;
+                      background:{row['Color']};
+                  "></span>
+                  <span style="font-weight:600; color:#12241C; font-size:0.68rem;
+                               white-space:nowrap; overflow:hidden; text-overflow:ellipsis;">
+                    {row['Category']}
+                  </span>
+                  <span style="margin-left:auto; color:#2A3F36; font-size:0.68rem;
+                               white-space:nowrap;">
+                    {row['KM']:,.0f}
+                  </span>
+                </div>
+                """
+            )
+        st.markdown("".join(rows_html), unsafe_allow_html=True)
+
+
 def _render_filtered_views(
-    table: pd.DataFrame, partner: str, type_pick: str, city: str
+    table: pd.DataFrame,
+    partner: str,
+    type_pick: str,
+    city: str,
 ) -> None:
     summary_base = table
     if city != "All cities":
@@ -478,15 +739,16 @@ def _render_filtered_views(
         ]
     )
     type_summary = pd.concat([type_summary, total_row], ignore_index=True)
-    for col in (
+    money_cols = (
         "Total Revenue",
         "Total Cash Collection",
         "Revenue",
         "Cash Collection",
         "Ola Customer Bill",
         "Ola Cash Collected",
-    ):
-        type_summary[col] = type_summary[col].round(2)
+    )
+    for col in money_cols:
+        type_summary[col] = (type_summary[col] / 1e5).round(2)
     type_summary["Total Trip"] = type_summary["Total Trip"].astype(int)
     type_summary["Vehicle Count"] = type_summary["Vehicle Count"].astype(int)
 
@@ -540,25 +802,61 @@ def _render_filtered_views(
         ]
     )
     ageing_summary = pd.concat([ageing_summary, ageing_total], ignore_index=True)
-    ageing_summary["Total Revenue"] = ageing_summary["Total Revenue"].round(2)
-    ageing_summary["Total Cash Collection"] = ageing_summary[
-        "Total Cash Collection"
-    ].round(2)
+    ageing_summary["Total Revenue"] = (ageing_summary["Total Revenue"] / 1e5).round(2)
+    ageing_summary["Total Cash Collection"] = (
+        ageing_summary["Total Cash Collection"] / 1e5
+    ).round(2)
     ageing_summary["Total Trip"] = ageing_summary["Total Trip"].astype(int)
     ageing_summary["Vehicle Count"] = ageing_summary["Vehicle Count"].astype(int)
 
     money_cfg = {
-        "Total Revenue": st.column_config.NumberColumn(format="₹%.2f"),
-        "Total Cash Collection": st.column_config.NumberColumn(format="₹%.2f"),
-        "Revenue": st.column_config.NumberColumn(format="₹%.2f"),
-        "Cash Collection": st.column_config.NumberColumn(format="₹%.2f"),
-        "Ola Customer Bill": st.column_config.NumberColumn(format="₹%.2f"),
-        "Ola Cash Collected": st.column_config.NumberColumn(format="₹%.2f"),
+        "Type": st.column_config.TextColumn("Type", alignment="center"),
+        "Total Revenue": st.column_config.NumberColumn(
+            "Total Revenue (L)", format="₹%.2f", alignment="center"
+        ),
+        "Total Cash Collection": st.column_config.NumberColumn(
+            "Total Cash (L)", format="₹%.2f", alignment="center"
+        ),
+        "Revenue": st.column_config.NumberColumn(
+            "Uber Rev (L)", format="₹%.2f", alignment="center"
+        ),
+        "Cash Collection": st.column_config.NumberColumn(
+            "Uber Cash (L)", format="₹%.2f", alignment="center"
+        ),
+        "Ola Customer Bill": st.column_config.NumberColumn(
+            "Ola Bill (L)", format="₹%.2f", alignment="center"
+        ),
+        "Ola Cash Collected": st.column_config.NumberColumn(
+            "Ola Cash (L)", format="₹%.2f", alignment="center"
+        ),
+        "Total Trip": st.column_config.NumberColumn(
+            "Total Trip", format="localized", alignment="center"
+        ),
+        "Vehicle Count": st.column_config.NumberColumn(
+            "Vehicle Count", format="localized", alignment="center"
+        ),
+    }
+
+    ageing_cfg = {
+        "Ageing": st.column_config.TextColumn("Ageing", alignment="center"),
+        "Total Revenue": st.column_config.NumberColumn(
+            "Total Revenue (L)", format="₹%.2f", alignment="center"
+        ),
+        "Total Cash Collection": st.column_config.NumberColumn(
+            "Total Cash (L)", format="₹%.2f", alignment="center"
+        ),
+        "Total Trip": st.column_config.NumberColumn(
+            "Total Trip", format="localized", alignment="center"
+        ),
+        "Vehicle Count": st.column_config.NumberColumn(
+            "Vehicle Count", format="localized", alignment="center"
+        ),
     }
 
     s1, s2 = st.columns(2)
     with s1:
         st.subheader("Type summary")
+        st.caption("Money values in ₹ Lakh")
         st.dataframe(
             type_summary,
             use_container_width=True,
@@ -568,15 +866,13 @@ def _render_filtered_views(
         )
     with s2:
         st.subheader("Ageing summary")
+        st.caption("Money values in ₹ Lakh")
         st.dataframe(
             ageing_summary,
             use_container_width=True,
             hide_index=True,
             height=200,
-            column_config={
-                "Total Revenue": st.column_config.NumberColumn(format="₹%.2f"),
-                "Total Cash Collection": st.column_config.NumberColumn(format="₹%.2f"),
-            },
+            column_config=ageing_cfg,
         )
 
     view = table
@@ -595,90 +891,158 @@ def _render_filtered_views(
 
     st.subheader("Detail")
     st.caption(
-        "Totals first · Total Revenue = Uber + Ola bill · "
-        "Total Cash = Uber + Ola cash · Total Trip = Uber + Ola trips · "
+        "Totals first · Total Revenue = Uber + Ola + Rapido · "
+        "Total Cash = Uber + Ola cash · Total Trip = Uber + Ola + Rapido · "
         "Total Intrip KM = Uber Trip Distance + Ola Actual Kms · "
         "Ideal KM = (30 × days) + (3 × trips) + Intrip · "
+        "Approved KM = min(GPS, Ideal) − Intrip · "
         "Buffer KM = GPS − Ideal · Deadmile Charges = max(0, Buffer) × 3 · "
-        "Dead KM = max(0, GPS − Ideal) · Type = Unproductive / Deadmile"
+        "Dead KM = max(0, GPS − Ideal) · Type = Unproductive / Deadmile · "
+        "Rapido Revenue = captain_earnings + toll · Ride Time = trip ride_time sum"
     )
+    # Display copy with comma-separated numbers (keeps underlying sort on view)
+    display = view.copy()
+    money_km_cols = [
+        "Total Revenue",
+        "Total Cash Collection",
+        "Total Intrip KM",
+        "GPS KMs",
+        "Ideal KM",
+        "Approved KM",
+        "Buffer KM",
+        "Deadmile Charges",
+        "Dead KM",
+        "Revenue",
+        "Cash Collection",
+        "Ola Customer Bill",
+        "Ola Cash Collected",
+        "Rapido Revenue",
+        "Trip Distance",
+        "Ola Actual Kms",
+        "Rapido Ride Time",
+    ]
+    int_cols = [
+        "Total Trip",
+        "Trip Completed Count",
+        "Ola Trips",
+        "Rapido Trips",
+        "Ola Trip Time",
+    ]
+    for col in money_km_cols:
+        if col in display.columns:
+            display[col] = display[col].map(
+                lambda v: f"{float(v):,.2f}" if pd.notna(v) else ""
+            )
+    for col in int_cols:
+        if col in display.columns:
+            display[col] = display[col].map(
+                lambda v: f"{int(float(v)):,}" if pd.notna(v) else ""
+            )
+
     st.dataframe(
-        view,
+        display,
         use_container_width=True,
         height=560,
         hide_index=True,
         column_config={
-            "Total Revenue": st.column_config.NumberColumn(
-                "Total Revenue", format="₹%.2f"
+            "Total Revenue": st.column_config.TextColumn("Total Revenue"),
+            "Total Cash Collection": st.column_config.TextColumn(
+                "Total Cash Collection"
             ),
-            "Total Cash Collection": st.column_config.NumberColumn(
-                "Total Cash Collection", format="₹%.2f"
-            ),
-            "Total Trip": st.column_config.NumberColumn("Total Trip"),
-            "Total Intrip KM": st.column_config.NumberColumn(
-                "Total Intrip KM", format="%.2f"
-            ),
-            "GPS KMs": st.column_config.NumberColumn("GPS KMs", format="%.2f"),
-            "Ideal KM": st.column_config.NumberColumn("Ideal KM", format="%.2f"),
-            "Buffer KM": st.column_config.NumberColumn("Buffer KM", format="%.2f"),
-            "Deadmile Charges": st.column_config.NumberColumn("Deadmile Charges", format="%.2f"),
-            "Dead KM": st.column_config.NumberColumn("Dead KM", format="%.2f"),
+            "Total Trip": st.column_config.TextColumn("Total Trip"),
+            "Total Intrip KM": st.column_config.TextColumn("Total Intrip KM"),
+            "GPS KMs": st.column_config.TextColumn("GPS KMs"),
+            "Ideal KM": st.column_config.TextColumn("Ideal KM"),
+            "Approved KM": st.column_config.TextColumn("Approved KM"),
+            "Buffer KM": st.column_config.TextColumn("Buffer KM"),
+            "Deadmile Charges": st.column_config.TextColumn("Deadmile Charges"),
+            "Dead KM": st.column_config.TextColumn("Dead KM"),
             "Dead KM Type": st.column_config.TextColumn("Dead KM Type"),
             "Run On": st.column_config.TextColumn("Run On"),
             "Ageing": st.column_config.TextColumn("Ageing"),
-            "Revenue": st.column_config.NumberColumn("Uber Revenue", format="₹%.2f"),
-            "Cash Collection": st.column_config.NumberColumn(
-                "Uber Cash", format="₹%.2f"
-            ),
-            "Ola Customer Bill": st.column_config.NumberColumn(
-                "Ola Customer Bill", format="₹%.2f"
-            ),
-            "Ola Cash Collected": st.column_config.NumberColumn(
-                "Ola Cash Collected", format="₹%.2f"
-            ),
-            "Trip Distance": st.column_config.NumberColumn(
-                "Uber Trip Distance", format="%.2f"
-            ),
-            "Ola Actual Kms": st.column_config.NumberColumn(
-                "Ola Actual Kms", format="%.2f"
-            ),
-            "GPS KMs": st.column_config.NumberColumn("GPS KMs", format="%.2f"),
-            "Ola Trip Time": st.column_config.NumberColumn("Ola Trip Time"),
-            "Trip Completed Count": st.column_config.NumberColumn("Uber Trips"),
-            "Ola Trips": st.column_config.NumberColumn("Ola Trips"),
+            "Revenue": st.column_config.TextColumn("Uber Revenue"),
+            "Cash Collection": st.column_config.TextColumn("Uber Cash"),
+            "Ola Customer Bill": st.column_config.TextColumn("Ola Customer Bill"),
+            "Ola Cash Collected": st.column_config.TextColumn("Ola Cash Collected"),
+            "Rapido Revenue": st.column_config.TextColumn("Rapido Revenue"),
+            "Trip Distance": st.column_config.TextColumn("Uber Trip Distance"),
+            "Ola Actual Kms": st.column_config.TextColumn("Ola Actual Kms"),
+            "Ola Trip Time": st.column_config.TextColumn("Ola Trip Time"),
+            "Rapido Ride Time": st.column_config.TextColumn("Rapido Ride Time"),
+            "Trip Completed Count": st.column_config.TextColumn("Uber Trips"),
+            "Ola Trips": st.column_config.TextColumn("Ola Trips"),
+            "Rapido Trips": st.column_config.TextColumn("Rapido Trips"),
         },
     )
 
 
-def main():
-    # Poll less often — Drive file checks are slow
-    @st.fragment(run_every=60)
-    def _watch_folders():
-        latest = current_data_fingerprint()
-        prev = st.session_state.get("seen_fingerprint")
-        if prev is None:
-            st.session_state.seen_fingerprint = latest
-            return
-        if latest and latest != prev:
-            st.session_state.seen_fingerprint = latest
-            st.cache_data.clear()
-            st.rerun()
+def _render_settings() -> None:
+    st.title("Settings")
+    st.caption("Data paths · Drive sync · cache")
 
-    _watch_folders()
+    st.subheader("Data")
+    st.write(
+        f"**Data root:** `{data_root()}`  \n"
+        f"**Uber:** `{uber_root()}`  \n"
+        f"**OLA:** `{ola_dir()}`  \n"
+        f"**GPS:** `{gps_dir()}`  \n"
+        f"**Rapido:** `{rapido_dir()}`  \n"
+        f"**Allocation:** `{allocation_dir()}`"
+    )
 
-    fp = current_data_fingerprint()
-    try:
-        available_dates = load_available_dates(fp)
-    except Exception:
-        available_dates = []
-
-    with st.sidebar:
-        st.markdown('<div class="brand">AI Dashboard</div>', unsafe_allow_html=True)
-        st.markdown(
-            '<div class="brand-sub">Allocation vehicles + Uber + Ola</div>',
-            unsafe_allow_html=True,
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+    st.subheader("Google Drive (Streamlit Cloud)")
+    if drive_configured():
+        st.success("Drive secrets found — Cloud can sync heavy data from Drive.")
+        c1, c2 = st.columns(2)
+        with c1:
+            if st.button("Sync Drive now", type="primary"):
+                info = ensure_data_ready(force=True, show_status=True)
+                st.session_state["drive_sync_info"] = info
+                st.cache_data.clear()
+                st.rerun()
+        with c2:
+            if st.button("Clear cache & reload"):
+                st.cache_data.clear()
+                for k in (
+                    "day_start",
+                    "day_end",
+                    "day_partner",
+                    "day_type",
+                    "day_city",
+                    "seen_fingerprint",
+                ):
+                    st.session_state.pop(k, None)
+                st.rerun()
+        info = st.session_state.get("drive_sync_info")
+        if info:
+            st.caption(
+                f"Last sync · mode={info.get('mode')} · "
+                f"downloaded={info.get('downloaded')} · cached={info.get('skipped')}"
+            )
+    else:
+        st.info(
+            "Local mode (no Drive secrets). On Streamlit Cloud add Secrets so "
+            "Uber/OLA/GPS/Rapido stay on Drive and sync here."
         )
-        if st.button("Refresh data now", use_container_width=True):
+        st.markdown(
+            """
+**Cloud setup (one time)**  
+1. Google Cloud → enable **Drive API** → create **service account** → JSON key  
+2. Share Drive folder **AI Dashboard** (and optionally **Rapido Data**) with the service account email as **Viewer**  
+3. Streamlit Cloud → **Settings → Secrets** — paste service account JSON under `[gcp_service_account]` and folder ID:
+
+```toml
+[drive]
+root_folder_id = "YOUR_AI_DASHBOARD_FOLDER_ID"
+rapido_data_folder_id = ""   # optional
+```
+
+Folder ID = last part of Drive folder URL.  
+Heavy files download once, then only when changed.
+            """
+        )
+        if st.button("Clear cache & reload", type="primary"):
             st.cache_data.clear()
             for k in (
                 "day_start",
@@ -689,12 +1053,25 @@ def main():
                 "seen_fingerprint",
             ):
                 st.session_state.pop(k, None)
+            st.success("Cache cleared.")
             st.rerun()
 
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+    st.subheader("Notes")
+    st.markdown(
+        """
+- Heavy data stays on **Google Drive** (not GitHub)
+- Local PC: uses `G:\\My Drive\\...` folders as before
+- Cloud: syncs into `.data_cache` then builds the same tables
+        """
+    )
+
+
+def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     st.title("Fleet day table")
     st.caption(
-        "Uber date = Drop-off 4am→4am (file 15–16 → day 15) · Ola = calendar date · "
-        "First load slow once, then cached"
+        "Uber date = Drop-off 4am→4am (file 15–16 → day 15) · "
+        "Ola / Rapido = calendar date · First load slow once, then cached"
     )
 
     if not available_dates:
@@ -739,6 +1116,19 @@ def main():
     except Exception as exc:
         st.error(f"Could not build table: {exc}")
         return
+
+    month_bounds = _current_month_range(available_dates)
+    pie_table: pd.DataFrame | None = None
+    pie_start = pie_end = ""
+    if month_bounds:
+        pie_start, pie_end = month_bounds
+        try:
+            if pie_start == start_date and pie_end == end_date:
+                pie_table = table
+            else:
+                pie_table, _ = load_range_table(pie_start, pie_end, fp)
+        except Exception:
+            pie_table = None
 
     city_sel = st.session_state.get("day_city", "All cities")
     table_for_opts = table
@@ -811,10 +1201,103 @@ def main():
         _render_ageing_chart(ageing_trend)
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
-    _render_revenue_deadmile_chart(rev_trend)
+
+    # Filter current-month pie by City / Partner / Type (dates stay frozen)
+    pie_base = pie_table if pie_table is not None else pd.DataFrame()
+    if not pie_base.empty:
+        if city != "All cities":
+            pie_base = pie_base[
+                pie_base["City"].fillna("").astype(str).str.strip() == city
+            ]
+        if partner != "All partners":
+            pie_base = pie_base[
+                pie_base["Partner Name"].fillna("").astype(str).str.strip() == partner
+            ]
+        if type_pick != "All types":
+            pie_base = pie_base[
+                pie_base["Type"].fillna("").astype(str).str.strip() == type_pick
+            ]
+
+    row2_l, row2_r = st.columns(2)
+    with row2_l:
+        _render_revenue_deadmile_chart(rev_trend)
+    with row2_r:
+        if pie_start and pie_end:
+            _render_km_mix_pie(
+                pie_base,
+                period_label=_month_label(pie_start, pie_end),
+            )
+        else:
+            st.subheader("KM mix")
+            st.caption("Current month (fixed) · no data for this month yet")
+            st.info("No available dates in the current calendar month.")
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
     _render_filtered_views(table, partner, type_pick, city)
+
+
+def main():
+    # Drive sync once per session (Cloud). Local without secrets = no-op.
+    if "drive_ready" not in st.session_state:
+        st.session_state["drive_sync_info"] = ensure_data_ready(
+            force=False, show_status=drive_configured()
+        )
+        st.session_state["drive_ready"] = True
+
+    # Poll less often — Drive file checks are slow
+    @st.fragment(run_every=60)
+    def _watch_folders():
+        latest = current_data_fingerprint()
+        prev = st.session_state.get("seen_fingerprint")
+        if prev is None:
+            st.session_state.seen_fingerprint = latest
+            return
+        if latest and latest != prev:
+            st.session_state.seen_fingerprint = latest
+            st.cache_data.clear()
+            st.rerun()
+
+    _watch_folders()
+
+    with st.sidebar:
+        st.markdown('<div class="brand">AI Dashboard</div>', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="brand-sub">Allocation + Uber + Ola + Rapido</div>',
+            unsafe_allow_html=True,
+        )
+        page = st.radio(
+            "Navigate",
+            options=["Dashboard", "Settings"],
+            key="nav_page",
+            label_visibility="collapsed",
+        )
+        st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+        if page == "Dashboard" and st.button(
+            "Refresh data now", use_container_width=True
+        ):
+            st.cache_data.clear()
+            for k in (
+                "day_start",
+                "day_end",
+                "day_partner",
+                "day_type",
+                "day_city",
+                "seen_fingerprint",
+            ):
+                st.session_state.pop(k, None)
+            st.rerun()
+
+    if page == "Settings":
+        _render_settings()
+        return
+
+    fp = current_data_fingerprint()
+    try:
+        available_dates = load_available_dates(fp)
+    except Exception:
+        available_dates = []
+
+    _render_dashboard(fp, available_dates)
 
 
 if __name__ == "__main__":
