@@ -199,7 +199,7 @@ def _file_sig(path: Path) -> str:
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v29-type-of-plan-match", source_fingerprint(uber_root())]
+    parts = ["v30-type-of-plan-nosort", source_fingerprint(uber_root())]
     for path in list_allocation_files(allocation_dir()):
         parts.append(f"alloc:{_file_sig(path)}")
     for path in list_partner_detail_files():

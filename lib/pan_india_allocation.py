@@ -262,7 +262,11 @@ def attach_type_of_plan(
 ) -> tuple[pd.DataFrame, dict]:
     """
     Add Type Of Plan using Vehicle + Operator/Driver ID + closest past Date Of Allocation.
-    Returns (fleet_with_plan, meta).
+
+    Trick:
+      key = Vehicle Number | Operator/Driver ID
+      for fleet date D → max(Date Of Allocation) where Date Of Allocation <= D
+      → that Type Of Plan
     """
     out = fleet.copy()
     if "Type Of Plan" not in out.columns:
@@ -297,47 +301,57 @@ def attach_type_of_plan(
         else pd.Timestamp.today().normalize()
     )
     if "Date" in out.columns:
-        asof = pd.to_datetime(out["Date"], errors="coerce")
-        asof = asof.fillna(fallback)
+        asof = pd.to_datetime(out["Date"], errors="coerce").fillna(fallback)
     else:
         asof = pd.Series(fallback, index=out.index)
+    asof = pd.to_datetime(asof, errors="coerce").dt.normalize()
 
-    keys = [
-        _match_key(v, p)
-        for v, p in zip(
-            out.get("Vehicle Number", pd.Series(dtype=str)).fillna(""),
-            out.get("Partner ID", pd.Series(dtype=str)).fillna(""),
-        )
-    ]
     left = pd.DataFrame(
         {
-            "_row": out.index,
-            "_key": keys,
-            "_asof": pd.to_datetime(asof, errors="coerce").dt.normalize(),
+            "_row": out.index.astype(int),
+            "_key": [
+                _match_key(v, p)
+                for v, p in zip(
+                    out.get("Vehicle Number", pd.Series(dtype=str)).fillna(""),
+                    out.get("Partner ID", pd.Series(dtype=str)).fillna(""),
+                )
+            ],
+            "_asof": asof,
         }
     )
-    left = left[left["_asof"].notna()].sort_values(["_key", "_asof"])
+    left = left[left["_key"].ne("|") & left["_asof"].notna()].copy()
 
-    right = (
-        pan_df[["_key", "Date Of Allocation", "Type Of Plan"]]
-        .rename(columns={"Date Of Allocation": "_asof"})
-        .dropna(subset=["_asof"])
-        .sort_values(["_key", "_asof"])
-    )
+    right = pan_df[["_key", "Date Of Allocation", "Type Of Plan"]].copy()
+    right["Date Of Allocation"] = pd.to_datetime(
+        right["Date Of Allocation"], errors="coerce"
+    ).dt.normalize()
+    right = right[
+        right["_key"].ne("|")
+        & right["Date Of Allocation"].notna()
+        & right["Type Of Plan"].fillna("").astype(str).str.strip().ne("")
+    ].copy()
 
     if left.empty or right.empty:
-        meta["message"] = "No valid dates to match Type Of Plan"
+        meta["message"] = "No valid Vehicle+ID keys to match Type Of Plan"
         return out, meta
 
-    matched = pd.merge_asof(
-        left,
-        right,
-        on="_asof",
-        by="_key",
-        direction="backward",
-    )
-    plan_by_row = matched.set_index("_row")["Type Of Plan"]
-    out["Type Of Plan"] = out.index.map(lambda i: plan_by_row.get(i, "")).fillna("")
+    # Same Vehicle+ID → keep plans with Date Of Allocation <= row Date,
+    # then pick highest past allocation date (avoids merge_asof sort errors)
+    joined = left.merge(right, on="_key", how="left")
+    joined = joined[
+        joined["Date Of Allocation"].isna()
+        | (joined["Date Of Allocation"] <= joined["_asof"])
+    ].copy()
+    if joined.empty:
+        meta["message"] = (
+            f"Pan India rows={meta['pan_rows']} · no past Date Of Allocation match"
+        )
+        return out, meta
+
+    joined = joined.sort_values(["_row", "Date Of Allocation"], na_position="first")
+    best = joined.groupby("_row", as_index=False).tail(1)
+    plan_map = best.set_index("_row")["Type Of Plan"].fillna("").astype(str)
+    out["Type Of Plan"] = out.index.map(lambda i: plan_map.get(i, "")).fillna("")
     out["Type Of Plan"] = (
         out["Type Of Plan"].astype(str).replace({"nan": "", "None": "", "NaT": ""})
     )
