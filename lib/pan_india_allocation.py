@@ -1,7 +1,7 @@
 """Pan India Allocation — Type Of Plan by Vehicle + Operator/Driver ID.
 
 Required columns from live Google Sheet:
-  - Date Of Allocation
+  - Date Of Allocation   (DD/MM/YYYY — India format)
   - Operator/Driver ID
   - Type Of Plan
   - Vehicle Number (header often Vehicle Num)
@@ -20,6 +20,7 @@ Data source: live Google Sheet auto-synced via service account (no manual Excel)
 from __future__ import annotations
 
 import re
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -104,10 +105,44 @@ def _norm_id_key(value) -> str:
     return _norm_partner_id(value)
 
 
-def _normalize_text(value) -> str:
-    """Trim plan labels (Type Of Plan / Driver Plan)."""
+def _parse_allocation_date(value) -> pd.Timestamp:
+    """Date Of Allocation is DD/MM/YYYY (India). Never treat as MM/DD/YYYY."""
+    if pd.isna(value):
+        return pd.NaT
+    if isinstance(value, pd.Timestamp):
+        return value.normalize() if pd.notna(value) else pd.NaT
     text = _trim(value)
-    return "" if text.lower() in {"nan", "none", "null", "nat", "-"} else text
+    if not text or text.lower() in {"nan", "none", "null", "nat", "-"}:
+        return pd.NaT
+
+    # Explicit DD/MM/YYYY (and common separators) — first priority
+    for fmt in ("%d/%m/%Y", "%d-%m-%Y", "%d.%m.%Y", "%d/%m/%y", "%d-%m-%y"):
+        try:
+            return pd.Timestamp(datetime.strptime(text, fmt)).normalize()
+        except ValueError:
+            pass
+
+    # Already ISO from Excel/Sheets export: 2024-06-12
+    for fmt in ("%Y-%m-%d", "%Y/%m/%d", "%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M:%S.%f"):
+        try:
+            return pd.Timestamp(datetime.strptime(text, fmt)).normalize()
+        except ValueError:
+            pass
+
+    # Excel serial number as string
+    if re.fullmatch(r"\d+(\.\d+)?", text):
+        try:
+            serial = float(text)
+            if 20000 < serial < 80000:
+                return (pd.Timestamp("1899-12-30") + pd.Timedelta(days=serial)).normalize()
+        except (ValueError, OverflowError):
+            pass
+
+    return pd.NaT
+
+
+def _parse_allocation_date_series(raw: pd.Series) -> pd.Series:
+    return raw.map(_parse_allocation_date)
 
 
 def _match_key(vehicle: str, partner_id: str) -> str:
@@ -246,19 +281,15 @@ def _read_pan_india_file(path: Path) -> pd.DataFrame:
         out = out.drop(columns=["Driver Plan"])
 
     raw_dates = out["Date Of Allocation"].copy()
-    out["Date Of Allocation"] = pd.to_datetime(
-        raw_dates, errors="coerce", dayfirst=True
-    ).dt.normalize()
-    # Retry ISO / Excel leftovers that dayfirst missed
+    # Sheet uses DD/MM/YYYY — never parse as US MM/DD/YYYY
+    out["Date Of Allocation"] = _parse_allocation_date_series(raw_dates)
+    # Unparseable dates kept as old sentinel so Vehicle+ID can still match
     still_nat = out["Date Of Allocation"].isna()
     if still_nat.any():
-        out.loc[still_nat, "Date Of Allocation"] = pd.to_datetime(
-            raw_dates.loc[still_nat], errors="coerce"
-        ).dt.normalize()
+        out.loc[still_nat, "Date Of Allocation"] = pd.Timestamp("1900-01-01")
 
     out = out[out["Vehicle Number"] != ""].copy()
     out = out[out["Operator/Driver ID"] != ""].copy()
-    out = out[out["Date Of Allocation"].notna()].copy()
     out = out[out["Type Of Plan"] != ""].copy()
 
     out["_key"] = [
@@ -322,6 +353,21 @@ def load_pan_india_allocation(
     }
 
 
+def _phone_tail(partner_id: str) -> str:
+    """Last 10 digits of ID (LETZHYDIP9550473489 → 9550473489)."""
+    digits = re.sub(r"\D", "", _norm_id_key(partner_id))
+    return digits[-10:] if len(digits) >= 10 else ""
+
+
+def _latest_plan_by_key(right: pd.DataFrame, key_col: str = "_key") -> pd.Series:
+    """Latest Type Of Plan per key (any date)."""
+    if right.empty:
+        return pd.Series(dtype=str)
+    work = right.sort_values([key_col, "Date Of Allocation"])
+    best = work.groupby(key_col, as_index=False).tail(1)
+    return best.set_index(key_col)["Type Of Plan"].fillna("").astype(str)
+
+
 def _asof_plan_lookup(
     left: pd.DataFrame,
     right: pd.DataFrame,
@@ -353,9 +399,12 @@ def attach_type_of_plan(
     pan_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Add Type Of Plan using ONLY Vehicle + Operator/Driver ID + closest past date.
+    Add Type Of Plan using Vehicle + Operator/Driver ID.
 
-    Never fall back to vehicle-only or id-only (that picks another partner's plan).
+    Order (never vehicle-only / other-partner guess):
+      1) same Vehicle+ID, closest Date Of Allocation <= row Date
+      2) same Vehicle+ID, latest plan any date (fixes future/bad sheet dates)
+      3) same Vehicle + phone-tail of ID (LETZ…9550473489 ↔ 9550473489)
     """
     out = fleet.copy()
     if "Type Of Plan" not in out.columns:
@@ -364,6 +413,9 @@ def attach_type_of_plan(
     meta = {
         "pan_rows": 0,
         "matched": 0,
+        "matched_asof": 0,
+        "matched_latest": 0,
+        "matched_phone": 0,
         "message": "",
     }
 
@@ -384,11 +436,25 @@ def attach_type_of_plan(
     meta["pan_rows"] = len(pan_df)
     meta["loaded_file"] = pan_meta.get("loaded_file", "")
 
-    if "_key" not in pan_df.columns:
-        pan_df = pan_df.copy()
-        veh = pan_df.get("Vehicle Number", pd.Series("", index=pan_df.index))
-        pid = pan_df.get("Operator/Driver ID", pd.Series("", index=pan_df.index))
-        pan_df["_key"] = [_match_key(v, p) for v, p in zip(veh, pid)]
+    pan_df = pan_df.copy()
+    if "Vehicle Number" not in pan_df.columns and "_veh_key" in pan_df.columns:
+        pan_df["Vehicle Number"] = pan_df["_veh_key"]
+    if "Operator/Driver ID" not in pan_df.columns and "_id_key" in pan_df.columns:
+        pan_df["Operator/Driver ID"] = pan_df["_id_key"]
+
+    veh_p = pan_df.get("Vehicle Number", pd.Series("", index=pan_df.index)).map(
+        _norm_vehicle_key
+    )
+    id_p = pan_df.get("Operator/Driver ID", pd.Series("", index=pan_df.index)).map(
+        _norm_id_key
+    )
+    pan_df["_key"] = [_match_key(v, p) for v, p in zip(veh_p, id_p)]
+    pan_df["_veh_key"] = veh_p
+    pan_df["_phone"] = [_phone_tail(p) for p in id_p]
+    pan_df["_veh_phone"] = [
+        f"{v}|{ph}" if v and ph else ""
+        for v, ph in zip(pan_df["_veh_key"], pan_df["_phone"])
+    ]
 
     fallback = (
         pd.Timestamp(as_of_date).normalize()
@@ -403,23 +469,31 @@ def attach_type_of_plan(
 
     veh_series = out.get("Vehicle Number", pd.Series("", index=out.index)).fillna("")
     pid_series = out.get("Partner ID", pd.Series("", index=out.index)).fillna("")
+    veh_l = [_norm_vehicle_key(v) for v in veh_series]
+    id_l = [_norm_id_key(p) for p in pid_series]
+    phone_l = [_phone_tail(p) for p in pid_series]
 
     left = pd.DataFrame(
         {
             "_row": out.index.astype(int),
-            "_key": [_match_key(v, p) for v, p in zip(veh_series, pid_series)],
+            "_key": [f"{v}|{i}" if v and i else "|" for v, i in zip(veh_l, id_l)],
+            "_veh_phone": [
+                f"{v}|{ph}" if v and ph else "" for v, ph in zip(veh_l, phone_l)
+            ],
             "_asof": asof,
-        }
+        },
+        index=out.index,
     )
-    left = left[left["_key"].ne("|") & left["_asof"].notna()].copy()
+    left = left[left["_asof"].notna()].copy()
 
-    right = pan_df[["_key", "Date Of Allocation", "Type Of Plan"]].copy()
+    right = pan_df[
+        ["_key", "_veh_phone", "Date Of Allocation", "Type Of Plan"]
+    ].copy()
     right["Date Of Allocation"] = pd.to_datetime(
         right["Date Of Allocation"], errors="coerce"
     ).dt.normalize()
     right = right[
-        right["_key"].ne("|")
-        & right["Date Of Allocation"].notna()
+        right["Date Of Allocation"].notna()
         & right["Type Of Plan"].fillna("").astype(str).str.strip().ne("")
     ].copy()
 
@@ -427,12 +501,74 @@ def attach_type_of_plan(
         meta["message"] = "No valid Vehicle+ID keys to match Type Of Plan"
         return out, meta
 
-    plan_map = _asof_plan_lookup(
-        left,
-        right,
+    plan_map = pd.Series("", index=out.index, dtype=object)
+    how = pd.Series("", index=out.index, dtype=object)
+
+    # 1) Exact Vehicle+ID, as-of date
+    primary = _asof_plan_lookup(
+        left[left["_key"].ne("|")],
+        right[["_key", "Date Of Allocation", "Type Of Plan"]],
         left_key="_key",
         right_key="_key",
     )
+    for row_i, plan in primary.items():
+        if str(plan).strip():
+            plan_map.loc[row_i] = str(plan).strip()
+            how.loc[row_i] = "asof"
+    meta["matched_asof"] = int((how == "asof").sum())
+
+    # 2) Exact Vehicle+ID, latest any date (same partner only)
+    still = plan_map.astype(str).str.strip().eq("")
+    if still.any():
+        latest = _latest_plan_by_key(
+            right[["_key", "Date Of Allocation", "Type Of Plan"]], "_key"
+        )
+        for idx in out.index[still]:
+            if idx not in left.index:
+                continue
+            key = str(left.at[idx, "_key"] or "")
+            if key and key != "|" and key in latest.index:
+                plan = str(latest.loc[key]).strip()
+                if plan:
+                    plan_map.loc[idx] = plan
+                    how.loc[idx] = "latest"
+        meta["matched_latest"] = int((how == "latest").sum())
+
+    # 3) Vehicle + phone-tail (handles LETZ…ID vs plain phone in sheet)
+    still = plan_map.astype(str).str.strip().eq("")
+    if still.any():
+        blank_idx = out.index[still]
+        left_ph = left.loc[left.index.intersection(blank_idx)]
+        left_ph = left_ph[left_ph["_veh_phone"].ne("")]
+        if not left_ph.empty:
+            right_ph = right[right["_veh_phone"].ne("")].copy()
+            phone_asof = _asof_plan_lookup(
+                left_ph,
+                right_ph[["_veh_phone", "Date Of Allocation", "Type Of Plan"]],
+                left_key="_veh_phone",
+                right_key="_veh_phone",
+            )
+            for row_i, plan in phone_asof.items():
+                if str(plan).strip() and not str(plan_map.loc[row_i]).strip():
+                    plan_map.loc[row_i] = str(plan).strip()
+                    how.loc[row_i] = "phone"
+            still = plan_map.astype(str).str.strip().eq("")
+            blank_idx = out.index[still]
+            left_ph2 = left.loc[left.index.intersection(blank_idx)]
+            left_ph2 = left_ph2[left_ph2["_veh_phone"].ne("")]
+            if not left_ph2.empty:
+                latest_ph = _latest_plan_by_key(
+                    right_ph[["_veh_phone", "Date Of Allocation", "Type Of Plan"]],
+                    "_veh_phone",
+                )
+                for idx in left_ph2.index:
+                    key = str(left_ph2.at[idx, "_veh_phone"] or "")
+                    if key and key in latest_ph.index:
+                        plan = str(latest_ph.loc[key]).strip()
+                        if plan:
+                            plan_map.loc[idx] = plan
+                            how.loc[idx] = "phone"
+        meta["matched_phone"] = int((how == "phone").sum())
 
     out["Type Of Plan"] = (
         plan_map.reindex(out.index).fillna("").astype(str).map(_normalize_text)
@@ -442,25 +578,33 @@ def attach_type_of_plan(
     )
     meta["matched"] = int((out["Type Of Plan"].astype(str).str.strip() != "").sum())
 
+    pan_keys = set(right["_key"].tolist())
     sample_blank: list[str] = []
     blank_n = int(len(out) - meta["matched"])
+    missing_in_sheet = 0
     if blank_n:
         blanks = out.loc[
             out["Type Of Plan"].astype(str).str.strip().eq(""),
             ["Vehicle Number", "Partner ID"],
-        ].head(5)
+        ].head(8)
         for _, r in blanks.iterrows():
-            sample_blank.append(
-                f"{_norm_vehicle_key(r.get('Vehicle Number', ''))}|"
-                f"{_norm_id_key(r.get('Partner ID', ''))}"
-            )
+            key = _match_key(r.get("Vehicle Number", ""), r.get("Partner ID", ""))
+            sample_blank.append(key)
+            if key not in pan_keys:
+                missing_in_sheet += 1
         meta["blank_samples"] = sample_blank
+        meta["blank_not_in_sheet"] = missing_in_sheet
 
     meta["message"] = (
         f"Pan India rows={meta['pan_rows']} · "
         f"Type Of Plan filled={meta['matched']}/{len(out)} "
-        f"(strict Vehicle+ID only)"
+        f"(asof={meta['matched_asof']}, latest={meta['matched_latest']}, "
+        f"phone={meta['matched_phone']})"
     )
     if sample_blank:
         meta["message"] += f" · blank e.g. {', '.join(sample_blank[:3])}"
+        if missing_in_sheet:
+            meta["message"] += (
+                f" · {missing_in_sheet} blank keys not found in synced Pan India"
+            )
     return out, meta
