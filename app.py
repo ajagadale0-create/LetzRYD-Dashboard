@@ -198,8 +198,46 @@ def _file_sig(path: Path) -> str:
         return f"{path.name}:missing"
 
 
+def _show_flash() -> None:
+    msg = st.session_state.pop("_flash", None)
+    if not msg:
+        return
+    st.success(msg)
+    try:
+        st.toast(msg, icon="✅")
+    except Exception:
+        pass
+
+
+def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading…") -> None:
+    """Clear Streamlit caches + force fingerprint rebuild, then rerun with visible feedback."""
+    st.cache_data.clear()
+    try:
+        st.cache_resource.clear()
+    except Exception:
+        pass
+    st.session_state["cache_nonce"] = int(st.session_state.get("cache_nonce", 0)) + 1
+    # Do NOT clear drive_ready — that forces a full Drive re-sync and freezes the app.
+    for k in (
+        "day_start",
+        "day_end",
+        "day_partner",
+        "day_type",
+        "day_city",
+        "seen_fingerprint",
+    ):
+        st.session_state.pop(k, None)
+    st.session_state["_flash"] = message
+    st.rerun()
+
+
 def current_data_fingerprint() -> str:
-    parts = ["v34-dd-mm-yyyy-allocation-date", source_fingerprint(uber_root())]
+    parts = ["v36-no-resync-on-clear-cache", source_fingerprint(uber_root())]
+    # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
+    try:
+        parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
+    except Exception:
+        parts.append("nonce:0")
     for path in list_allocation_files(allocation_dir()):
         parts.append(f"alloc:{_file_sig(path)}")
     for path in list_partner_detail_files():
@@ -1105,6 +1143,7 @@ def _render_filtered_views(
 
 
 def _render_settings() -> None:
+    _show_flash()
     st.title("Settings")
     st.caption("Data paths · Drive sync · cache")
 
@@ -1126,30 +1165,22 @@ def _render_settings() -> None:
         st.success("Drive secrets found — Cloud can sync heavy data from Drive.")
         c1, c2 = st.columns(2)
         with c1:
-            if st.button("Sync Drive now", type="primary"):
+            if st.button("Sync Drive now", type="primary", key="settings_sync_drive"):
                 info = ensure_data_ready(force=True, show_status=True)
                 st.session_state["drive_sync_info"] = info
-                st.cache_data.clear()
-                st.rerun()
+                _clear_caches_and_reload(
+                    message="Drive synced + cache cleared — reloading…"
+                )
         with c2:
-            if st.button("Clear cache & reload"):
-                st.cache_data.clear()
-                for k in (
-                    "day_start",
-                    "day_end",
-                    "day_partner",
-                    "day_type",
-                    "day_city",
-                    "seen_fingerprint",
-                ):
-                    st.session_state.pop(k, None)
-                st.rerun()
+            if st.button("Clear cache & reload", key="settings_clear_cache"):
+                _clear_caches_and_reload()
         info = st.session_state.get("drive_sync_info")
         if info:
             st.caption(
                 f"Last sync · mode={info.get('mode')} · "
                 f"downloaded={info.get('downloaded')} · cached={info.get('skipped')}"
             )
+        st.caption(f"Cache nonce: {int(st.session_state.get('cache_nonce', 0))}")
     else:
         st.info(
             "Local mode (no Drive secrets). On Streamlit Cloud add Secrets so "
@@ -1172,19 +1203,10 @@ Folder ID = last part of Drive folder URL.
 Heavy files download once, then only when changed.
             """
         )
-        if st.button("Clear cache & reload", type="primary"):
-            st.cache_data.clear()
-            for k in (
-                "day_start",
-                "day_end",
-                "day_partner",
-                "day_type",
-                "day_city",
-                "seen_fingerprint",
-            ):
-                st.session_state.pop(k, None)
-            st.success("Cache cleared.")
-            st.rerun()
+        if st.button(
+            "Clear cache & reload", type="primary", key="settings_clear_cache_local"
+        ):
+            _clear_caches_and_reload()
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
     st.subheader("Notes")
@@ -1626,6 +1648,7 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
 
 
 def main():
+    _show_flash()
     # Drive sync once per session (Cloud). Local without secrets = no-op.
     if "drive_ready" not in st.session_state:
         st.session_state["drive_sync_info"] = ensure_data_ready(
@@ -1662,19 +1685,9 @@ def main():
         )
         st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
         if page in {"Dashboard", "Partner"} and st.button(
-            "Refresh data now", use_container_width=True
+            "Refresh data now", use_container_width=True, key="sidebar_refresh"
         ):
-            st.cache_data.clear()
-            for k in (
-                "day_start",
-                "day_end",
-                "day_partner",
-                "day_type",
-                "day_city",
-                "seen_fingerprint",
-            ):
-                st.session_state.pop(k, None)
-            st.rerun()
+            _clear_caches_and_reload(message="Refreshed — data reloading…")
 
     if page == "Settings":
         _render_settings()

@@ -101,8 +101,16 @@ def _normalize_private_key(raw: Any) -> str:
 
 
 def _drive_service():
+    import socket
+
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
+
+    # Prevent infinite hang on Drive download/export
+    try:
+        socket.setdefaulttimeout(90)
+    except Exception:
+        pass
 
     info = _secrets_dict()["gcp"]
     creds_info = {k: info[k] for k in info}
@@ -122,7 +130,15 @@ def _drive_service():
             'in Secrets, e.g. private_key = """-----BEGIN...-----END...""". '
             f"Detail: {type(exc).__name__}"
         ) from None
-    return build("drive", "v3", credentials=creds, cache_discovery=False)
+
+    try:
+        import httplib2
+        from google_auth_httplib2 import AuthorizedHttp
+
+        http = AuthorizedHttp(creds, http=httplib2.Http(timeout=90))
+        return build("drive", "v3", http=http, cache_discovery=False)
+    except Exception:
+        return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
 def _list_children(service, folder_id: str) -> list[dict]:
@@ -341,24 +357,33 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
             "root": str(code_root()),
         }
 
+    # Use existing cache immediately so UI is not blocked waiting on full sync
+    dest_root = cache_dir()
+    if dest_root.exists():
+        os.environ["AI_DASHBOARD_DATA_ROOT"] = str(dest_root)
+
+    def _run_sync() -> dict:
+        # Small sheets first (Type Of Plan / Partner), then heavy folders
+        form_sync = sync_allocation_form_sheets(force=force)
+        info = sync_drive_data(force=force)
+        info["form_sheets"] = form_sync
+        return info
+
     if show_status:
         try:
             import streamlit as st
 
             with st.status("Syncing data from Google Drive…", expanded=True) as status:
-                st.write(
-                    "Uber/OLA/GPS/Rapido + live Google Sheets "
-                    "(Partner Details, Pan India Allocation) — auto, no Excel needed."
-                )
-                info = sync_drive_data(force=force)
-                # Always refresh Allocation & Drop off form sheets via service account
+                st.write("1/2 Partner + Pan India sheets…")
                 form_sync = sync_allocation_form_sheets(force=force)
-                info["form_sheets"] = form_sync
                 if form_sync.get("synced"):
-                    st.write("Live sheets: " + ", ".join(form_sync["synced"]))
+                    st.write("Sheets: " + ", ".join(form_sync["synced"]))
+                st.write("2/2 Uber/OLA/GPS/Rapido/Allocation (only changed files)…")
+                info = sync_drive_data(force=force)
+                info["form_sheets"] = form_sync
                 if info.get("errors"):
                     st.write("Some files failed:")
-                    for e in info["errors"]:
+                    for e in info["errors"][:8]:
                         st.write(f"- {e}")
                 st.write(
                     f"Files seen: {info.get('files', 0)} · "
@@ -370,11 +395,11 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
                     state="complete" if info.get("ok") else "error",
                 )
                 return info
-        except Exception:
-            pass
-    info = sync_drive_data(force=force)
-    info["form_sheets"] = sync_allocation_form_sheets(force=force)
-    return info
+        except Exception as exc:
+            info = _run_sync()
+            info["status_error"] = str(exc)
+            return info
+    return _run_sync()
 
 
 def sync_named_sheet_from_drive(
