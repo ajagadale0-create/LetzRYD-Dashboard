@@ -45,10 +45,21 @@ from lib.rapido_process import (
     rapido_dir,
 )
 from lib.partner_details import (
+    AGE_BUCKETS,
+    build_ageing_basket_summary,
+    build_operator_vehicle_summary,
+    build_operator_vehicle_table,
     build_partner_status_table,
     list_partner_detail_files,
     load_partner_details,
+    onboarding_type_options,
     partner_details_dir,
+    sync_partner_sheet,
+    _normalize_onboarding_type,
+)
+from lib.pan_india_allocation import (
+    list_pan_india_files,
+    pan_india_dir,
 )
 from lib.drive_sync import drive_configured, ensure_data_ready
 from lib.paths import data_root
@@ -188,11 +199,13 @@ def _file_sig(path: Path) -> str:
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v26-run-on-mix", source_fingerprint(uber_root())]
+    parts = ["v28-type-of-plan", source_fingerprint(uber_root())]
     for path in list_allocation_files(allocation_dir()):
         parts.append(f"alloc:{_file_sig(path)}")
     for path in list_partner_detail_files():
         parts.append(f"partner:{_file_sig(path)}")
+    for path in list_pan_india_files():
+        parts.append(f"panindia:{_file_sig(path)}")
     for path in list_ola_files():
         parts.append(f"ola:{_file_sig(path)}")
     for path in list_gps_files():
@@ -1005,6 +1018,7 @@ def _render_filtered_views(
         "Approved KM = min(GPS, Ideal) − Intrip · "
         "Buffer KM = GPS − Ideal · Deadmile Charges = max(0, Buffer) × 3 · "
         "Dead KM = max(0, GPS − Ideal) · Type = Unproductive / Deadmile · "
+        "Type Of Plan = Pan India Allocation (Vehicle + Partner ID, closest past Date Of Allocation) · "
         "Rapido Revenue = captain_earnings + toll · Ride Time = trip ride_time sum"
     )
     # Display copy with comma-separated numbers (keeps underlying sort on view)
@@ -1067,6 +1081,8 @@ def _render_filtered_views(
             "Dead KM Type": st.column_config.TextColumn("Dead KM Type"),
             "Run On": st.column_config.TextColumn("Run On"),
             "Ageing": st.column_config.TextColumn("Ageing"),
+            "Type Of Plan": st.column_config.TextColumn("Type Of Plan"),
+            "Type": st.column_config.TextColumn("Type"),
             "Revenue": st.column_config.TextColumn("Uber Revenue"),
             "Cash Collection": st.column_config.TextColumn("Uber Cash"),
             "Ola Customer Bill": st.column_config.TextColumn("Ola Customer Bill"),
@@ -1095,7 +1111,8 @@ def _render_settings() -> None:
         f"**GPS:** `{gps_dir()}`  \n"
         f"**Rapido:** `{rapido_dir()}`  \n"
         f"**Allocation:** `{allocation_dir()}`  \n"
-        f"**Partner onboarding:** `{partner_details_dir()}`"
+        f"**Partner onboarding:** `{partner_details_dir()}`  \n"
+        f"**Pan India Allocation:** `{pan_india_dir()}`"
     )
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
@@ -1171,7 +1188,7 @@ Heavy files download once, then only when changed.
 - Heavy data stays on **Google Drive** (not GitHub)
 - Local PC: uses `G:\\My Drive\\...` folders as before
 - Cloud: syncs into `.data_cache` then builds the same tables
-- Partner onboarding reader supports exported `.xlsx` / `.xls` / `.csv` files
+- Partner / Pan India sheets auto-sync from Drive (no Excel export needed)
         """
     )
 
@@ -1193,11 +1210,22 @@ def _render_partner_page(fp: str) -> None:
 
     if partner_df.empty:
         st.info(partner_meta.get("message", "No partner onboarding data found."))
+        sync_info = partner_meta.get("sync") or {}
+        if sync_info.get("message"):
+            st.caption(sync_info["message"])
         if partner_meta.get("gsheet_files"):
             st.caption(
-                "This folder currently has only Google Sheet shortcuts. Export the sheet as "
-                f"`.xlsx` or `.csv` into `{partner_details_dir()}` so the app can read it."
+                "Live Google Sheet will auto-sync via service account. "
+                "Confirm sheet is shared Viewer with letzryd-drive@… then Refresh."
             )
+        if st.button("Sync partner sheet now", key="partner_sync_empty"):
+            st.cache_data.clear()
+            info = sync_partner_sheet()
+            if info.get("ok"):
+                st.success(info["message"])
+            else:
+                st.warning(info.get("message", "Sync failed"))
+            st.rerun()
         return
 
     partner_view, status_meta = build_partner_status_table(partner_df, alloc_df)
@@ -1205,13 +1233,7 @@ def _render_partner_page(fp: str) -> None:
         st.info("No partner rows available after cleaning onboarding data.")
         return
 
-    type_values = sorted(
-        {
-            str(v).strip()
-            for v in partner_view["Onboarding Type"].fillna("").tolist()
-            if str(v).strip()
-        }
-    )
+    type_values = onboarding_type_options(partner_view["Onboarding Type"].tolist())
     city_values = sorted(
         {str(v).strip() for v in partner_view["City"].fillna("").tolist() if str(v).strip()}
     )
@@ -1246,7 +1268,7 @@ def _render_partner_page(fp: str) -> None:
 
     view = partner_view.copy()
     if type_pick != "All onboarding types":
-        view = view[view["Onboarding Type"] == type_pick]
+        view = view[view["Onboarding Type"].map(_normalize_onboarding_type) == type_pick]
     if city_pick != "All cities":
         view = view[view["City"] == city_pick]
     if status_pick != "All status":
@@ -1274,80 +1296,126 @@ def _render_partner_page(fp: str) -> None:
     )
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
-    age_order = ["< 25", "25-34", "35-44", "45-54", "55+", "Unknown"]
-    chart_df = (
-        view.groupby(["Ageing", "Partner Status"], as_index=False)
-        .agg(Partners=("Partner ID", "nunique"))
-        .copy()
+    age_summary = build_ageing_basket_summary(view)
+    chart_rows = age_summary[age_summary["Ageing"] != "Total"].copy()
+    chart_long = chart_rows.melt(
+        id_vars="Ageing",
+        value_vars=["Active", "Inactive"],
+        var_name="Partner Status",
+        value_name="Partners",
     )
-    if not chart_df.empty:
-        chart_df["Ageing"] = pd.Categorical(
-            chart_df["Ageing"], categories=age_order, ordered=True
-        )
-        chart_df = chart_df.sort_values(["Ageing", "Partner Status"])
-        fig = px.bar(
-            chart_df,
-            x="Ageing",
-            y="Partners",
-            color="Partner Status",
-            barmode="group",
-            text="Partners",
-            category_orders={"Ageing": age_order, "Partner Status": ["Active", "Inactive"]},
-            color_discrete_map={"Active": "#0F6E56", "Inactive": "#C45C26"},
-            labels={"Ageing": "Driver Age", "Partners": "Partner IDs"},
-        )
-        fig.update_traces(textposition="outside", cliponaxis=False)
-        fig.update_layout(
-            autosize=True,
-            height=320,
-            margin=dict(l=4, r=8, t=40, b=8),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
-            yaxis=dict(gridcolor="#DCE6E1", title="Partner IDs"),
-            xaxis=dict(title="Driver Age"),
-        )
-        _show_plotly(fig)
-    else:
-        st.info("No partner rows available for the selected filters.")
+    chart_long = chart_long[chart_long["Partners"] > 0]
 
-    age_summary = (
-        view.groupby(["Ageing", "Partner Status"], as_index=False)
-        .agg(
-            **{
-                "Partner IDs": ("Partner ID", "nunique"),
-                "Drivers": ("Driver Name", "nunique"),
-            }
+    left, right = st.columns([1.35, 1])
+    with left:
+        st.subheader("Ageing basket")
+        st.caption("Driver age buckets · Active vs Inactive partner IDs")
+        if not chart_long.empty:
+            fig = px.bar(
+                chart_long,
+                x="Ageing",
+                y="Partners",
+                color="Partner Status",
+                barmode="stack",
+                text="Partners",
+                category_orders={
+                    "Ageing": AGE_BUCKETS,
+                    "Partner Status": ["Active", "Inactive"],
+                },
+                color_discrete_map={"Active": "#0F6E56", "Inactive": "#C45C26"},
+                labels={"Ageing": "Age bucket", "Partners": "Partner IDs"},
+            )
+            fig.update_traces(
+                texttemplate="%{text}",
+                textposition="inside",
+                insidetextanchor="middle",
+                cliponaxis=False,
+                textfont=dict(size=11, family="DM Sans", color="#FFFFFF"),
+            )
+            totals = chart_rows.set_index("Ageing")["Total"]
+            fig.add_scatter(
+                x=totals.index.tolist(),
+                y=totals.values.tolist(),
+                mode="text",
+                text=[str(int(v)) if int(v) else "" for v in totals.values],
+                textposition="top center",
+                textfont=dict(size=12, family="DM Sans", color="#0B1F18"),
+                showlegend=False,
+                hoverinfo="skip",
+            )
+            y_max = float(chart_rows["Total"].max()) if len(chart_rows) else 0
+            fig.update_layout(
+                autosize=True,
+                height=340,
+                margin=dict(l=4, r=8, t=44, b=8),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+                yaxis=dict(
+                    gridcolor="#DCE6E1",
+                    title="Partner IDs",
+                    range=[0, y_max * 1.22 + 2],
+                ),
+                xaxis=dict(title=""),
+                bargap=0.35,
+            )
+            _show_plotly(fig)
+        else:
+            st.info("No partner rows available for ageing chart.")
+
+    with right:
+        st.subheader("Ageing table")
+        st.caption("Basket-wise Active / Inactive / Total")
+        st.dataframe(
+            age_summary,
+            use_container_width=True,
+            hide_index=True,
+            height=340,
+            column_config={
+                "Ageing": st.column_config.TextColumn("Ageing", alignment="center"),
+                "Active": st.column_config.NumberColumn("Active", format="localized"),
+                "Inactive": st.column_config.NumberColumn("Inactive", format="localized"),
+                "Total": st.column_config.NumberColumn("Total", format="localized"),
+                "Active %": st.column_config.NumberColumn("Active %", format="%.1f"),
+            },
         )
-        .copy()
+
+    operator_summary = build_operator_vehicle_summary(alloc_df, view)
+    operator_table = build_operator_vehicle_table(alloc_df, view)
+
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+    st.subheader("Operator · vehicle count")
+    st.caption("Latest allocation date · vehicles per Operator partner ID")
+    st.dataframe(
+        operator_summary,
+        use_container_width=True,
+        hide_index=True,
+        height=220,
+        column_config={
+            "Vehicles": st.column_config.TextColumn("Vehicles", alignment="center"),
+            "Operators": st.column_config.NumberColumn("Operators", format="localized"),
+            "Active": st.column_config.NumberColumn("Active", format="localized"),
+            "Inactive": st.column_config.NumberColumn("Inactive", format="localized"),
+        },
     )
-    if not age_summary.empty:
-        age_summary["Ageing"] = pd.Categorical(
-            age_summary["Ageing"], categories=age_order, ordered=True
-        )
-        age_summary = age_summary.sort_values(["Ageing", "Partner Status"]).reset_index(
-            drop=True
-        )
 
-    type_summary = (
-        view.groupby(["Onboarding Type", "Partner Status"], as_index=False)
-        .agg(
-            **{
-                "Partner IDs": ("Partner ID", "nunique"),
-                "Drivers": ("Driver Name", "nunique"),
-            }
-        )
-        .sort_values(["Onboarding Type", "Partner Status"])
-        .reset_index(drop=True)
+    st.dataframe(
+        operator_table,
+        use_container_width=True,
+        hide_index=True,
+        height=420,
+        column_config={
+            "Partner ID": st.column_config.TextColumn("Partner ID"),
+            "Driver Name": st.column_config.TextColumn("Driver Name"),
+            "City": st.column_config.TextColumn("City"),
+            "Vehicle Count": st.column_config.NumberColumn(
+                "Vehicle Count", format="localized"
+            ),
+            "Partner Status": st.column_config.TextColumn("Status"),
+            "Ageing": st.column_config.TextColumn("Ageing", alignment="center"),
+            "Driver Age": st.column_config.NumberColumn("Age", format="%d"),
+        },
     )
-
-    s1, s2 = st.columns(2)
-    with s1:
-        st.subheader("Ageing summary")
-        st.dataframe(age_summary, use_container_width=True, hide_index=True, height=220)
-    with s2:
-        st.subheader("Onboarding summary")
-        st.dataframe(type_summary, use_container_width=True, hide_index=True, height=220)
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
     st.subheader("Partner detail")

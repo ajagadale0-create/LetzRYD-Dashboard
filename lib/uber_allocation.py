@@ -18,6 +18,7 @@ TABLE_COLS = [
     "Partner ID",
     "Partner Name",
     "Type",
+    "Type Of Plan",
     "DM Name",
     "Latest Allocation Date",
     "Drop Off Date",
@@ -726,6 +727,18 @@ def assemble_fleet_table(
     ]
 
     joined["Ageing"] = _assign_ageing(joined["Partner ID"], joined["Total Revenue"])
+
+    # Type Of Plan from Pan India Allocation:
+    # Vehicle + Partner ID → closest past Date Of Allocation (<= End date)
+    try:
+        from lib.pan_india_allocation import attach_type_of_plan
+
+        joined = attach_type_of_plan(joined, as_of_date=end)
+    except Exception:
+        joined["Type Of Plan"] = ""
+    if "Type Of Plan" not in joined.columns:
+        joined["Type Of Plan"] = ""
+    joined["Type Of Plan"] = joined["Type Of Plan"].fillna("").astype(str)
 
     joined = (
         joined[TABLE_COLS]

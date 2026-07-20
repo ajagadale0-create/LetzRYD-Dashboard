@@ -286,7 +286,9 @@ def sync_drive_data(*, force: bool = False) -> dict:
         is_sheet = item.get("mimeType") == "application/vnd.google-apps.spreadsheet"
         # Exported XLSX should overwrite the cached file.
         if is_sheet:
-            dest = dest.with_suffix(".xlsx")
+            # Clean trailing spaces from Google Sheet titles (e.g. "Pan India Allocation ")
+            clean_name = (item.get("name") or rel.name).strip() or rel.stem
+            dest = dest_root / rel.parent / f"{clean_name}.xlsx"
         need = force or not dest.exists() or prev.get("modifiedTime") != mtime
         if not need:
             skipped += 1
@@ -326,7 +328,7 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
     """
     Call once at app start.
     Local without secrets → local folders.
-    Cloud with secrets → sync Drive cache.
+    Cloud with secrets → sync Drive cache (incl. Google Sheets as XLSX cache).
     """
     if not drive_configured():
         os.environ.pop("AI_DASHBOARD_DATA_ROOT", None)
@@ -344,8 +346,16 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
             import streamlit as st
 
             with st.status("Syncing data from Google Drive…", expanded=True) as status:
-                st.write("Heavy files download only when changed (cached).")
+                st.write(
+                    "Uber/OLA/GPS/Rapido + live Google Sheets "
+                    "(Partner Details, Pan India Allocation) — auto, no Excel needed."
+                )
                 info = sync_drive_data(force=force)
+                # Always refresh Allocation & Drop off form sheets via service account
+                form_sync = sync_allocation_form_sheets(force=force)
+                info["form_sheets"] = form_sync
+                if form_sync.get("synced"):
+                    st.write("Live sheets: " + ", ".join(form_sync["synced"]))
                 if info.get("errors"):
                     st.write("Some files failed:")
                     for e in info["errors"]:
@@ -362,4 +372,128 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
                 return info
         except Exception:
             pass
-    return sync_drive_data(force=force)
+    info = sync_drive_data(force=force)
+    info["form_sheets"] = sync_allocation_form_sheets(force=force)
+    return info
+
+
+def sync_named_sheet_from_drive(
+    *,
+    name_hint: str,
+    dest_name: str,
+    force: bool = False,
+) -> dict:
+    """
+    Find a Google Sheet under AI Dashboard → Allocation & Drop off form
+    and export it to .data_cache (or data_root) as XLSX.
+    User never exports Excel — service account does it.
+    """
+    if not drive_configured():
+        return {
+            "ok": False,
+            "message": "Drive secrets not set",
+            "path": "",
+            "bytes": 0,
+        }
+
+    secrets = _secrets_dict()
+    root_id = str(secrets["drive"].get("root_folder_id", "")).strip()
+    if not root_id:
+        return {"ok": False, "message": "Missing drive.root_folder_id", "path": "", "bytes": 0}
+
+    try:
+        service = _drive_service()
+        top = _list_children(service, root_id)
+        form_folder = None
+        for item in top:
+            name = (item.get("name") or "").strip().casefold()
+            if _is_folder(item) and "allocation" in name and "drop" in name:
+                form_folder = item
+                break
+        if not form_folder:
+            return {
+                "ok": False,
+                "message": "Allocation & Drop off form folder not found on Drive",
+                "path": "",
+                "bytes": 0,
+            }
+
+        hint = name_hint.strip().casefold()
+        sheet_item = None
+        for item in _list_children(service, form_folder["id"]):
+            name = (item.get("name") or "").strip().casefold()
+            mime = item.get("mimeType") or ""
+            if mime == "application/vnd.google-apps.spreadsheet" and hint in name:
+                sheet_item = item
+                break
+        if not sheet_item:
+            return {
+                "ok": False,
+                "message": f"Google Sheet matching '{name_hint}' not found",
+                "path": "",
+                "bytes": 0,
+            }
+
+        dest_root = cache_dir()
+        dest = dest_root / "Allocation & Drop off form" / dest_name
+        meta_path = dest_root / META_NAME
+        meta = _load_meta(meta_path)
+        key = sheet_item["id"]
+        mtime = str(sheet_item.get("modifiedTime") or "")
+        prev = meta.get(key, {})
+        if (
+            not force
+            and dest.exists()
+            and prev.get("modifiedTime") == mtime
+        ):
+            os.environ["AI_DASHBOARD_DATA_ROOT"] = str(dest_root)
+            return {
+                "ok": True,
+                "message": f"Cached {dest.name}",
+                "path": str(dest),
+                "bytes": dest.stat().st_size,
+                "skipped": True,
+                "sheet_id": key,
+            }
+
+        _export_spreadsheet_xlsx(service, key, dest)
+        meta[key] = {
+            "name": sheet_item.get("name"),
+            "path": str(dest.relative_to(dest_root)).replace("\\", "/"),
+            "size": str(dest.stat().st_size),
+            "modifiedTime": mtime,
+        }
+        _save_meta(meta_path, meta)
+        os.environ["AI_DASHBOARD_DATA_ROOT"] = str(dest_root)
+        return {
+            "ok": True,
+            "message": f"Auto-synced {dest.name}",
+            "path": str(dest),
+            "bytes": dest.stat().st_size,
+            "skipped": False,
+            "sheet_id": key,
+        }
+    except Exception as exc:
+        return {
+            "ok": False,
+            "message": f"Auto-sync failed: {exc}",
+            "path": "",
+            "bytes": 0,
+        }
+
+
+def sync_allocation_form_sheets(*, force: bool = False) -> dict:
+    """Auto-sync Partner Details + Pan India Allocation Google Sheets."""
+    results = {}
+    synced = []
+    for hint, dest in (
+        ("partner details", "Partner Details.xlsx"),
+        ("pan india allocation", "Pan India Allocation.xlsx"),
+    ):
+        info = sync_named_sheet_from_drive(
+            name_hint=hint, dest_name=dest, force=force
+        )
+        results[hint] = info
+        if info.get("ok"):
+            synced.append(dest)
+    return {"ok": all(v.get("ok") for v in results.values()), "synced": synced, "details": results}
