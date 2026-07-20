@@ -1011,16 +1011,20 @@ def _render_filtered_views(
 
     st.subheader("Detail")
     st.caption(
-        "Totals first · Total Revenue = Uber + Ola + Rapido · "
-        "Total Cash = Uber + Ola cash · Total Trip = Uber + Ola + Rapido · "
-        "Total Intrip KM = Uber Trip Distance + Ola Actual Kms · "
-        "Ideal KM = (30 × days) + (3 × trips) + Intrip · "
-        "Approved KM = min(GPS, Ideal) − Intrip · "
-        "Buffer KM = GPS − Ideal · Deadmile Charges = max(0, Buffer) × 3 · "
-        "Dead KM = max(0, GPS − Ideal) · Type = Unproductive / Deadmile · "
-        "Type Of Plan = Pan India Allocation (Vehicle + Partner ID, closest past Date Of Allocation) · "
-        "Rapido Revenue = captain_earnings + toll · Ride Time = trip ride_time sum"
+        "Date = allocation status day used for Partner ID · "
+        "Type Of Plan = closest past Pan India plan for Vehicle + Partner ID on that Date · "
+        "Totals = Uber + Ola + Rapido for selected Start→End range"
     )
+    dl1, dl2 = st.columns([1, 4])
+    with dl1:
+        csv_bytes = view.to_csv(index=False).encode("utf-8-sig")
+        st.download_button(
+            "Download CSV",
+            data=csv_bytes,
+            file_name="fleet_detail.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
     # Display copy with comma-separated numbers (keeps underlying sort on view)
     display = view.copy()
     money_km_cols = [
@@ -1066,6 +1070,9 @@ def _render_filtered_views(
         height=560,
         hide_index=True,
         column_config={
+            "Date": st.column_config.TextColumn("Date"),
+            "Type Of Plan": st.column_config.TextColumn("Type Of Plan"),
+            "Type": st.column_config.TextColumn("Type"),
             "Total Revenue": st.column_config.TextColumn("Total Revenue"),
             "Total Cash Collection": st.column_config.TextColumn(
                 "Total Cash Collection"
@@ -1081,8 +1088,6 @@ def _render_filtered_views(
             "Dead KM Type": st.column_config.TextColumn("Dead KM Type"),
             "Run On": st.column_config.TextColumn("Run On"),
             "Ageing": st.column_config.TextColumn("Ageing"),
-            "Type Of Plan": st.column_config.TextColumn("Type Of Plan"),
-            "Type": st.column_config.TextColumn("Type"),
             "Revenue": st.column_config.TextColumn("Uber Revenue"),
             "Cash Collection": st.column_config.TextColumn("Uber Cash"),
             "Ola Customer Bill": st.column_config.TextColumn("Ola Customer Bill"),

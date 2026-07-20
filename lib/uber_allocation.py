@@ -13,6 +13,7 @@ from lib.rapido_process import build_rapido_vehicle_days, rapido_dir
 from lib.uber_process import build_uber_vehicle_days
 
 TABLE_COLS = [
+    "Date",
     "Vehicle Number",
     "City",
     "Partner ID",
@@ -593,6 +594,15 @@ def assemble_fleet_table(
         row_drop.loc[no_partner].dt.strftime("%Y-%m-%d").replace({"NaT": ""}).fillna("")
     )
 
+    # Keep the allocation status day used for Partner ID (last day in range)
+    lookup["Date"] = pd.to_datetime(lookup["Date"], errors="coerce").dt.strftime(
+        "%Y-%m-%d"
+    )
+    lookup["Date"] = lookup["Date"].replace({"NaT": ""}).fillna("")
+    # If blank, fall back to range end (selected End filter)
+    blank_date = lookup["Date"].eq("")
+    lookup.loc[blank_date, "Date"] = end.strftime("%Y-%m-%d")
+
     summary = _agg_metric_days(
         uber_days,
         start,
@@ -729,7 +739,7 @@ def assemble_fleet_table(
     joined["Ageing"] = _assign_ageing(joined["Partner ID"], joined["Total Revenue"])
 
     # Type Of Plan from Pan India Allocation:
-    # Vehicle + Partner ID → closest past Date Of Allocation (<= End date)
+    # Vehicle + Partner ID → closest past Date Of Allocation (<= row Date)
     try:
         from lib.pan_india_allocation import attach_type_of_plan
 
@@ -739,10 +749,13 @@ def assemble_fleet_table(
     if "Type Of Plan" not in joined.columns:
         joined["Type Of Plan"] = ""
     joined["Type Of Plan"] = joined["Type Of Plan"].fillna("").astype(str)
+    if "Date" not in joined.columns:
+        joined["Date"] = end.strftime("%Y-%m-%d")
+    joined["Date"] = joined["Date"].fillna(end.strftime("%Y-%m-%d")).astype(str)
 
     joined = (
         joined[TABLE_COLS]
-        .sort_values(["Partner Name", "Vehicle Number"], ascending=True)
+        .sort_values(["Date", "Partner Name", "Vehicle Number"], ascending=True)
         .reset_index(drop=True)
     )
 

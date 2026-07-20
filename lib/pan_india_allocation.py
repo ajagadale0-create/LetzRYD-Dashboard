@@ -196,14 +196,15 @@ def load_pan_india_allocation(folder: Path | None = None) -> tuple[pd.DataFrame,
 
 def attach_type_of_plan(
     fleet: pd.DataFrame,
-    as_of_date: str | pd.Timestamp,
+    as_of_date: str | pd.Timestamp | None = None,
     pan_df: pd.DataFrame | None = None,
 ) -> pd.DataFrame:
     """
     Add Type Of Plan to fleet rows.
 
     For each Vehicle Number + Partner ID:
-      pick the Pan India row with max Date Of Allocation <= as_of_date.
+      pick the Pan India row with max Date Of Allocation <= row Date
+      (or as_of_date if Date column missing).
     """
     out = fleet.copy()
     if "Type Of Plan" not in out.columns:
@@ -217,16 +218,16 @@ def attach_type_of_plan(
     if pan_df is None or pan_df.empty:
         return out
 
-    as_of = pd.Timestamp(as_of_date).normalize()
-    hist = pan_df[pan_df["Date Of Allocation"] <= as_of].copy()
-    if hist.empty:
-        return out
-
-    latest = (
-        hist.sort_values(["_key", "Date Of Allocation"])
-        .drop_duplicates("_key", keep="last")
-        .loc[:, ["_key", "Type Of Plan"]]
+    fallback = (
+        pd.Timestamp(as_of_date).normalize()
+        if as_of_date is not None
+        else pd.Timestamp.today().normalize()
     )
+    if "Date" in out.columns:
+        asof = pd.to_datetime(out["Date"], errors="coerce")
+        asof = asof.fillna(fallback)
+    else:
+        asof = pd.Series(fallback, index=out.index)
 
     keys = [
         _match_key(v, p)
@@ -235,9 +236,28 @@ def attach_type_of_plan(
             out.get("Partner ID", pd.Series(dtype=str)).fillna(""),
         )
     ]
-    out["_key"] = keys
-    out = out.drop(columns=["Type Of Plan"], errors="ignore")
-    out = out.merge(latest, on="_key", how="left")
-    out["Type Of Plan"] = out["Type Of Plan"].fillna("").astype(str)
-    out = out.drop(columns=["_key"])
+    left = pd.DataFrame(
+        {
+            "_row": out.index,
+            "_key": keys,
+            "_asof": asof.dt.normalize(),
+        }
+    ).sort_values(["_key", "_asof"])
+
+    right = (
+        pan_df[["_key", "Date Of Allocation", "Type Of Plan"]]
+        .rename(columns={"Date Of Allocation": "_asof"})
+        .sort_values(["_key", "_asof"])
+    )
+
+    matched = pd.merge_asof(
+        left,
+        right,
+        on="_asof",
+        by="_key",
+        direction="backward",
+    )
+    plan_by_row = matched.set_index("_row")["Type Of Plan"]
+    out["Type Of Plan"] = out.index.map(lambda i: plan_by_row.get(i, "")).fillna("")
+    out["Type Of Plan"] = out["Type Of Plan"].astype(str).replace({"nan": "", "None": ""})
     return out
