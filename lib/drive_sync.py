@@ -344,7 +344,8 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
     """
     Call once at app start.
     Local without secrets → local folders.
-    Cloud with secrets → sync Drive cache (incl. Google Sheets as XLSX cache).
+    Cloud: refresh small Partner/Pan India sheets; full Uber/OLA sync only when
+    force=True (Sync Drive now) or cache is empty.
     """
     if not drive_configured():
         os.environ.pop("AI_DASHBOARD_DATA_ROOT", None)
@@ -357,43 +358,73 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
             "root": str(code_root()),
         }
 
-    # Use existing cache immediately so UI is not blocked waiting on full sync
     dest_root = cache_dir()
-    if dest_root.exists():
-        os.environ["AI_DASHBOARD_DATA_ROOT"] = str(dest_root)
+    dest_root.mkdir(parents=True, exist_ok=True)
+    os.environ["AI_DASHBOARD_DATA_ROOT"] = str(dest_root)
+
+    meta_path = dest_root / META_NAME
+    cache_ok = meta_path.exists() and any(
+        (dest_root / name).exists()
+        for name in ("Uber", "Vehicle Allocation Status", "OLA", "GPS")
+    )
+
+    def _light_info(form_sync: dict) -> dict:
+        return {
+            "ok": True,
+            "mode": "drive-cache",
+            "message": "Using cached Drive data (Partner/Pan India refreshed)",
+            "files": 0,
+            "downloaded": 0,
+            "skipped": 0,
+            "root": str(dest_root),
+            "form_sheets": form_sync,
+            "fast_boot": True,
+        }
 
     def _run_sync() -> dict:
-        # Small sheets first (Type Of Plan / Partner), then heavy folders
-        form_sync = sync_allocation_form_sheets(force=force)
-        info = sync_drive_data(force=force)
-        info["form_sheets"] = form_sync
-        return info
+        form_sync = sync_allocation_form_sheets(force=True)
+        if force or not cache_ok:
+            info = sync_drive_data(force=force)
+            info["form_sheets"] = form_sync
+            info["fast_boot"] = False
+            return info
+        return _light_info(form_sync)
 
     if show_status:
         try:
             import streamlit as st
 
-            with st.status("Syncing data from Google Drive…", expanded=True) as status:
-                st.write("1/2 Partner + Pan India sheets…")
-                form_sync = sync_allocation_form_sheets(force=force)
+            with st.status("Starting dashboard…", expanded=True) as status:
+                st.write("Refreshing Partner + Pan India (fast)…")
+                form_sync = sync_allocation_form_sheets(force=True)
                 if form_sync.get("synced"):
                     st.write("Sheets: " + ", ".join(form_sync["synced"]))
-                st.write("2/2 Uber/OLA/GPS/Rapido/Allocation (only changed files)…")
-                info = sync_drive_data(force=force)
-                info["form_sheets"] = form_sync
+                elif form_sync.get("details"):
+                    for hint, det in (form_sync.get("details") or {}).items():
+                        st.write(f"{hint}: {det.get('message', '')}")
+
+                if force or not cache_ok:
+                    st.write("Full Drive sync (Uber/OLA/GPS) — first time / forced…")
+                    info = sync_drive_data(force=force)
+                    info["form_sheets"] = form_sync
+                    info["fast_boot"] = False
+                else:
+                    st.write(
+                        "Using cached Uber/OLA/GPS — "
+                        "click Sync Drive now only when those files change."
+                    )
+                    info = _light_info(form_sync)
+
                 if info.get("errors"):
                     st.write("Some files failed:")
                     for e in info["errors"][:8]:
                         st.write(f"- {e}")
                 st.write(
-                    f"Files seen: {info.get('files', 0)} · "
                     f"Downloaded: {info.get('downloaded', 0)} · "
-                    f"Cached: {info.get('skipped', 0)}"
+                    f"Cached/skipped: {info.get('skipped', 0)} · "
+                    f"fast_boot={info.get('fast_boot')}"
                 )
-                status.update(
-                    label="Drive sync done" if info.get("ok") else "Drive sync finished with errors",
-                    state="complete" if info.get("ok") else "error",
-                )
+                status.update(label="Ready", state="complete")
                 return info
         except Exception as exc:
             info = _run_sync()

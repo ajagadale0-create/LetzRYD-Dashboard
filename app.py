@@ -232,7 +232,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v36-no-resync-on-clear-cache", source_fingerprint(uber_root())]
+    parts = ["v37-fast-boot-skip-heavy-sync", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1656,20 +1656,10 @@ def main():
         )
         st.session_state["drive_ready"] = True
 
-    # Poll less often — Drive file checks are slow
-    @st.fragment(run_every=60)
-    def _watch_folders():
-        latest = current_data_fingerprint()
-        prev = st.session_state.get("seen_fingerprint")
-        if prev is None:
-            st.session_state.seen_fingerprint = latest
-            return
-        if latest and latest != prev:
-            st.session_state.seen_fingerprint = latest
-            st.cache_data.clear()
-            st.rerun()
-
-    _watch_folders()
+    # Poll disabled — fingerprint walk every 60s slows Cloud boots.
+    # Use sidebar "Refresh data now" or Settings "Sync Drive now" instead.
+    # @st.fragment(run_every=60)
+    # def _watch_folders(): ...
 
     with st.sidebar:
         st.markdown('<div class="brand">AI Dashboard</div>', unsafe_allow_html=True)
