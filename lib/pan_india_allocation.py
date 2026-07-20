@@ -6,15 +6,13 @@ Required columns from live Google Sheet:
   - Type Of Plan
   - Vehicle Number (header often Vehicle Num)
 
-Trick:
+Trick (STRICT — no vehicle-only / id-only guess):
   key = Vehicle Number + Operator/Driver ID
   for a fleet row date D → take max Date Of Allocation <= D for that key
-  → that row's Type Of Plan
+  → that row's Type Of Plan column only
 
-Fallbacks (only when primary key misses):
-  1) Driver Plan fills blank Type Of Plan on the sheet row
-  2) Vehicle-only as-of match
-  3) Partner-ID-only as-of match
+If Type Of Plan cell is blank on a sheet row, Driver Plan on the SAME row
+may fill it (never borrow plan from another vehicle or another partner).
 
 Data source: live Google Sheet auto-synced via service account (no manual Excel).
 """
@@ -185,7 +183,7 @@ def _map_required_columns(df: pd.DataFrame) -> dict[str, str]:
     if veh_col:
         mapping[veh_col] = "Vehicle Number"
 
-    # Optional: some rows fill Driver Plan, not Type Of Plan
+    # Optional: same-row fill only when Type Of Plan cell blank
     driver_plan_col = _pick_column(
         cols,
         lambda s: s == "driver plan",
@@ -272,8 +270,6 @@ def _read_pan_india_file(path: Path) -> pd.DataFrame:
         _match_key(v, p)
         for v, p in zip(out["Vehicle Number"], out["Operator/Driver ID"])
     ]
-    out["_veh_key"] = out["Vehicle Number"]
-    out["_id_key"] = out["Operator/Driver ID"]
     out = (
         out.sort_values(["_key", "Date Of Allocation"])
         .drop_duplicates(["_key", "Date Of Allocation"], keep="last")
@@ -290,7 +286,6 @@ def load_pan_india_allocation(
     sync_info = sync_pan_india_sheet(force=force_sync)
     files = list_pan_india_files(folder)
     if not files and not sync_info.get("ok"):
-        # One forced retry — sheet may be new on Drive
         sync_info = sync_pan_india_sheet(force=True)
         files = list_pan_india_files(folder)
 
@@ -363,14 +358,9 @@ def attach_type_of_plan(
     pan_df: pd.DataFrame | None = None,
 ) -> tuple[pd.DataFrame, dict]:
     """
-    Add Type Of Plan using Vehicle + Operator/Driver ID + closest past Date Of Allocation.
+    Add Type Of Plan using ONLY Vehicle + Operator/Driver ID + closest past date.
 
-    Trick:
-      key = Vehicle Number | Operator/Driver ID
-      for fleet date D → max(Date Of Allocation) where Date Of Allocation <= D
-      → that Type Of Plan
-
-    If primary key misses: vehicle-only, then partner-id-only (same as-of rule).
+    Never fall back to vehicle-only or id-only (that picks another partner's plan).
     """
     out = fleet.copy()
     if "Type Of Plan" not in out.columns:
@@ -379,9 +369,6 @@ def attach_type_of_plan(
     meta = {
         "pan_rows": 0,
         "matched": 0,
-        "matched_primary": 0,
-        "matched_vehicle": 0,
-        "matched_id": 0,
         "message": "",
     }
 
@@ -402,23 +389,11 @@ def attach_type_of_plan(
     meta["pan_rows"] = len(pan_df)
     meta["loaded_file"] = pan_meta.get("loaded_file", "")
 
-    # Allow callers/tests to pass a minimal pan_df without helper keys
-    if "_veh_key" not in pan_df.columns:
-        pan_df = pan_df.copy()
-        pan_df["_veh_key"] = pan_df.get(
-            "Vehicle Number", pd.Series("", index=pan_df.index)
-        ).map(_norm_vehicle_key)
-    if "_id_key" not in pan_df.columns:
-        pan_df = pan_df.copy()
-        pan_df["_id_key"] = pan_df.get(
-            "Operator/Driver ID", pd.Series("", index=pan_df.index)
-        ).map(_norm_id_key)
     if "_key" not in pan_df.columns:
         pan_df = pan_df.copy()
-        pan_df["_key"] = [
-            _match_key(v, p)
-            for v, p in zip(pan_df["_veh_key"], pan_df["_id_key"])
-        ]
+        veh = pan_df.get("Vehicle Number", pd.Series("", index=pan_df.index))
+        pid = pan_df.get("Operator/Driver ID", pd.Series("", index=pan_df.index))
+        pan_df["_key"] = [_match_key(v, p) for v, p in zip(veh, pid)]
 
     fallback = (
         pd.Timestamp(as_of_date).normalize()
@@ -438,21 +413,18 @@ def attach_type_of_plan(
         {
             "_row": out.index.astype(int),
             "_key": [_match_key(v, p) for v, p in zip(veh_series, pid_series)],
-            "_veh_key": [_norm_vehicle_key(v) for v in veh_series],
-            "_id_key": [_norm_id_key(p) for p in pid_series],
             "_asof": asof,
         }
     )
-    left = left[left["_asof"].notna()].copy()
+    left = left[left["_key"].ne("|") & left["_asof"].notna()].copy()
 
-    right = pan_df[
-        ["_key", "_veh_key", "_id_key", "Date Of Allocation", "Type Of Plan"]
-    ].copy()
+    right = pan_df[["_key", "Date Of Allocation", "Type Of Plan"]].copy()
     right["Date Of Allocation"] = pd.to_datetime(
         right["Date Of Allocation"], errors="coerce"
     ).dt.normalize()
     right = right[
-        right["Date Of Allocation"].notna()
+        right["_key"].ne("|")
+        & right["Date Of Allocation"].notna()
         & right["Type Of Plan"].fillna("").astype(str).str.strip().ne("")
     ].copy()
 
@@ -460,61 +432,23 @@ def attach_type_of_plan(
         meta["message"] = "No valid Vehicle+ID keys to match Type Of Plan"
         return out, meta
 
-    plan_map = pd.Series("", index=out.index, dtype=object)
-    match_how = pd.Series("", index=out.index, dtype=object)
-
-    primary = _asof_plan_lookup(
-        left[left["_key"].ne("|")],
-        right[["_key", "Date Of Allocation", "Type Of Plan"]],
+    plan_map = _asof_plan_lookup(
+        left,
+        right,
         left_key="_key",
         right_key="_key",
     )
-    for row_i, plan in primary.items():
-        if str(plan).strip():
-            plan_map.loc[row_i] = str(plan).strip()
-            match_how.loc[row_i] = "vehicle+id"
-    meta["matched_primary"] = int((match_how == "vehicle+id").sum())
 
-    still = plan_map.astype(str).str.strip().eq("")
-    if still.any():
-        left_veh = left[left["_row"].isin(out.index[still]) & left["_veh_key"].ne("")]
-        veh_plans = _asof_plan_lookup(
-            left_veh,
-            right[["_veh_key", "Date Of Allocation", "Type Of Plan"]],
-            left_key="_veh_key",
-            right_key="_veh_key",
-        )
-        for row_i, plan in veh_plans.items():
-            if still.loc[row_i] and str(plan).strip():
-                plan_map.loc[row_i] = str(plan).strip()
-                match_how.loc[row_i] = "vehicle"
-                still.loc[row_i] = False
-        meta["matched_vehicle"] = int((match_how == "vehicle").sum())
-
-    still = plan_map.astype(str).str.strip().eq("")
-    if still.any():
-        left_id = left[left["_row"].isin(out.index[still]) & left["_id_key"].ne("")]
-        id_plans = _asof_plan_lookup(
-            left_id,
-            right[["_id_key", "Date Of Allocation", "Type Of Plan"]],
-            left_key="_id_key",
-            right_key="_id_key",
-        )
-        for row_i, plan in id_plans.items():
-            if still.loc[row_i] and str(plan).strip():
-                plan_map.loc[row_i] = str(plan).strip()
-                match_how.loc[row_i] = "id"
-        meta["matched_id"] = int((match_how == "id").sum())
-
-    out["Type Of Plan"] = plan_map.reindex(out.index).fillna("").astype(str)
-    out["Type Of Plan"] = out["Type Of Plan"].map(_normalize_text)
+    out["Type Of Plan"] = (
+        plan_map.reindex(out.index).fillna("").astype(str).map(_normalize_text)
+    )
     out["Type Of Plan"] = out["Type Of Plan"].replace(
         {"nan": "", "None": "", "NaT": ""}
     )
     meta["matched"] = int((out["Type Of Plan"].astype(str).str.strip() != "").sum())
 
-    blank_n = int(len(out) - meta["matched"])
     sample_blank: list[str] = []
+    blank_n = int(len(out) - meta["matched"])
     if blank_n:
         blanks = out.loc[
             out["Type Of Plan"].astype(str).str.strip().eq(""),
@@ -529,10 +463,8 @@ def attach_type_of_plan(
 
     meta["message"] = (
         f"Pan India rows={meta['pan_rows']} · "
-        f"Type Of Plan filled={meta['matched']}/{len(out)}"
-        f" (v+id={meta['matched_primary']}"
-        f", veh={meta['matched_vehicle']}"
-        f", id={meta['matched_id']})"
+        f"Type Of Plan filled={meta['matched']}/{len(out)} "
+        f"(strict Vehicle+ID only)"
     )
     if sample_blank:
         meta["message"] += f" · blank e.g. {', '.join(sample_blank[:3])}"
