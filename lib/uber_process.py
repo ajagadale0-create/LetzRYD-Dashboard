@@ -13,6 +13,8 @@ from pathlib import Path
 
 import pandas as pd
 
+from lib.allocation import _norm_vehicle
+
 CASH_COL = "Paid to you : Trip balance : Payouts : Cash collected"
 FARE_COL = "Paid to you : Your earnings : Fare"
 TOLL_COL = "Paid to you:Trip balance:Refunds:Toll"
@@ -210,9 +212,7 @@ def _prepared_pt_trip(base: Path | None = None) -> tuple[pd.DataFrame, pd.DataFr
     pt["Revenue"] = pt[FARE_COL] + pt[TOLL_COL] + pt[TOLL_ADJ_COL] + pt[TIP_COL]
 
     pt = assign_vehicle_numbers(pt, trip)
-    pt["Vehicle Number"] = (
-        pt["Vehicle Number"].fillna("").astype(str).str.upper().str.replace(r"\s+", "", regex=True)
-    )
+    pt["Vehicle Number"] = pt["Vehicle Number"].map(_norm_vehicle)
 
     trip = trip.copy()
     trip["Trip UUID"] = trip["Trip UUID"].fillna("").astype(str).str.strip()

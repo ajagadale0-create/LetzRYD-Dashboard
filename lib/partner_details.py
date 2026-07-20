@@ -12,6 +12,7 @@ from pathlib import Path
 import pandas as pd
 
 from lib.paths import data_root
+from lib.allocation import _norm_partner_id
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
 PARTNER_EXPORT_NAME = "Partner Details.xlsx"
@@ -190,6 +191,7 @@ def _read_partner_file(path: Path) -> pd.DataFrame:
         out[col] = out[col].map(_normalize_text)
 
     out = out[out["Duplicate Check"].str.casefold() == "unique"].copy()
+    out["Partner ID"] = out["Partner ID"].map(_normalize_text).map(_norm_partner_id)
     out = out[out["Partner ID"] != ""].copy()
     out["Driver DOB"] = pd.to_datetime(
         out["Driver Date of Birth"], errors="coerce", dayfirst=True
@@ -338,7 +340,7 @@ def build_operator_vehicle_summary(
     veh_counts = pd.DataFrame(columns=["Partner ID", "Vehicle Count"])
     if not day.empty and "partner IDs" in day.columns:
         alloc_ops = day.copy()
-        alloc_ops["Partner ID"] = alloc_ops["partner IDs"].fillna("").astype(str).str.strip()
+        alloc_ops["Partner ID"] = alloc_ops["partner IDs"].map(_norm_partner_id)
         alloc_ops = alloc_ops[
             (alloc_ops["Partner ID"] != "") & (alloc_ops["Partner ID"].str.upper() != "RFD")
         ]
@@ -401,7 +403,7 @@ def build_operator_vehicle_table(
     veh_counts = pd.DataFrame(columns=["Partner ID", "Vehicle Count"])
     if not day.empty and "partner IDs" in day.columns:
         alloc_ops = day.copy()
-        alloc_ops["Partner ID"] = alloc_ops["partner IDs"].fillna("").astype(str).str.strip()
+        alloc_ops["Partner ID"] = alloc_ops["partner IDs"].map(_norm_partner_id)
         alloc_ops = alloc_ops[
             (alloc_ops["Partner ID"] != "") & (alloc_ops["Partner ID"].str.upper() != "RFD")
         ]

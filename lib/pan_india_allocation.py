@@ -24,7 +24,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from lib.allocation import _norm_partner_id
+from lib.allocation import _norm_partner_id, _norm_vehicle
 from lib.paths import code_root, data_root
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
@@ -84,7 +84,7 @@ def list_pan_india_files(folder: Path | None = None) -> list[Path]:
 
 
 def _trim(value) -> str:
-    """Aggressive trim for matching: spaces, NBSP, zero-width, tabs/newlines."""
+    """Aggressive trim for plan text (spaces, NBSP, zero-width)."""
     if pd.isna(value):
         return ""
     text = str(value)
@@ -95,25 +95,13 @@ def _trim(value) -> str:
 
 
 def _norm_vehicle_key(value) -> str:
-    """KA-05-AN-9208 / ka 05 an 9208 → KA05AN9208 (trim + alphanum only)."""
-    text = _trim(value).upper()
-    if not text:
-        return ""
-    return re.sub(r"[^A-Z0-9]", "", text)
+    """Same vehicle trim as allocation / Uber / OLA / GPS / Rapido."""
+    return _norm_vehicle(value)
 
 
 def _norm_id_key(value) -> str:
-    """Trim + remove all internal spaces for Partner / Operator ID match."""
-    text = _trim(value).upper()
-    if not text:
-        return ""
-    text = re.sub(r"\s+", "", text)
-    if text.lower() in {"nan", "none", "null", "-", "rfd"}:
-        return ""
-    # Excel float leftovers: 9550473489.0
-    if re.fullmatch(r"\d+\.0+", text):
-        text = text.split(".", 1)[0]
-    return _norm_partner_id(text).strip().upper()
+    """Same Partner / Operator ID trim as allocation fleet table."""
+    return _norm_partner_id(value)
 
 
 def _normalize_text(value) -> str:
@@ -257,9 +245,16 @@ def _read_pan_india_file(path: Path) -> pd.DataFrame:
         out.loc[blank_plan, "Type Of Plan"] = out.loc[blank_plan, "Driver Plan"]
         out = out.drop(columns=["Driver Plan"])
 
+    raw_dates = out["Date Of Allocation"].copy()
     out["Date Of Allocation"] = pd.to_datetime(
-        out["Date Of Allocation"], errors="coerce", dayfirst=True
+        raw_dates, errors="coerce", dayfirst=True
     ).dt.normalize()
+    # Retry ISO / Excel leftovers that dayfirst missed
+    still_nat = out["Date Of Allocation"].isna()
+    if still_nat.any():
+        out.loc[still_nat, "Date Of Allocation"] = pd.to_datetime(
+            raw_dates.loc[still_nat], errors="coerce"
+        ).dt.normalize()
 
     out = out[out["Vehicle Number"] != ""].copy()
     out = out[out["Operator/Driver ID"] != ""].copy()

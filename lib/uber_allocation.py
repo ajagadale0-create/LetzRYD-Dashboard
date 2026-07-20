@@ -6,7 +6,7 @@ from pathlib import Path
 
 import pandas as pd
 
-from lib.allocation import _norm_partner_id, load_allocation
+from lib.allocation import _norm_partner_id, _norm_vehicle, load_allocation
 from lib.ola_process import build_ola_vehicle_days, ola_dir
 from lib.gps_process import build_gps_vehicle_days, gps_dir
 from lib.rapido_process import build_rapido_vehicle_days, rapido_dir
@@ -556,6 +556,9 @@ def assemble_fleet_table(
         lookup[col] = lookup[col].where(
             ~lookup[col].str.lower().isin(["nan", "none", "nat"]), ""
         )
+    # Same trim as Pan India / all datasets — required for Type Of Plan key
+    lookup["Partner ID"] = lookup["Partner ID"].map(_norm_partner_id)
+    lookup["Vehicle Number"] = lookup["Vehicle Number"].map(_norm_vehicle)
 
     id_by_name: dict[str, str] = {}
     name_by_id: dict[str, str] = {}

@@ -29,18 +29,33 @@ def allocation_dir(base: Path | None = None) -> Path:
     return data_root() / "Vehicle Allocation Status"
 
 
-def _norm_vehicle(value) -> str:
+def _trim_key(value) -> str:
+    """Strip spaces / NBSP / zero-width junk used across all Vehicle + ID matching."""
     if pd.isna(value):
         return ""
-    return re.sub(r"\s+", "", str(value).strip().upper())
+    text = str(value)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00a0]", "", text)
+    text = text.strip()
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _norm_vehicle(value) -> str:
+    """TG-07-X-9842 / tg 07 x 9842 → TG07X9842 (trim + alphanum only)."""
+    text = _trim_key(value).upper()
+    if not text or text.lower() in {"nan", "none", "null", "-"}:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", text)
 
 
 def _norm_partner_id(value) -> str:
-    if pd.isna(value):
+    """Trim + uppercase Partner / Operator ID for consistent joins."""
+    text = _trim_key(value).upper()
+    if not text or text.lower() in {"nan", "none", "null", "-", "rfd"}:
         return ""
-    text = str(value).strip()
-    if text.lower() in {"nan", "none", "null", "-"}:
-        return ""
+    # Excel float leftovers: 9550473489.0
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
     return text
 
 
