@@ -95,6 +95,12 @@ def _trim(value) -> str:
     return text
 
 
+def _normalize_text(value) -> str:
+    """Trim plan labels (Type Of Plan / Driver Plan)."""
+    text = _trim(value)
+    return "" if text.lower() in {"nan", "none", "null", "nat", "-"} else text
+
+
 def _norm_vehicle_key(value) -> str:
     """Same vehicle trim as allocation / Uber / OLA / GPS / Rapido."""
     return _norm_vehicle(value)
