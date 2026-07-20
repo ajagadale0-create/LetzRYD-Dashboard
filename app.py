@@ -199,7 +199,7 @@ def _file_sig(path: Path) -> str:
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v28-type-of-plan", source_fingerprint(uber_root())]
+    parts = ["v29-type-of-plan-match", source_fingerprint(uber_root())]
     for path in list_allocation_files(allocation_dir()):
         parts.append(f"alloc:{_file_sig(path)}")
     for path in list_partner_detail_files():
@@ -1488,6 +1488,21 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     except Exception as exc:
         st.error(f"Could not build table: {exc}")
         return
+
+    plan_info = (_meta or {}).get("type_of_plan") or {}
+    if plan_info.get("message"):
+        if int(plan_info.get("matched") or 0) == 0:
+            st.warning(
+                "Type Of Plan blank — "
+                + str(plan_info.get("message"))
+                + (
+                    (" · " + "; ".join(plan_info.get("errors", [])))
+                    if plan_info.get("errors")
+                    else ""
+                )
+            )
+        else:
+            st.caption(str(plan_info.get("message")))
 
     month_bounds = _current_month_range(available_dates)
     pie_table: pd.DataFrame | None = None

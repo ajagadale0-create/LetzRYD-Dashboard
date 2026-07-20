@@ -740,12 +740,14 @@ def assemble_fleet_table(
 
     # Type Of Plan from Pan India Allocation:
     # Vehicle + Partner ID → closest past Date Of Allocation (<= row Date)
+    plan_meta: dict = {}
     try:
         from lib.pan_india_allocation import attach_type_of_plan
 
-        joined = attach_type_of_plan(joined, as_of_date=end)
-    except Exception:
+        joined, plan_meta = attach_type_of_plan(joined, as_of_date=end)
+    except Exception as exc:
         joined["Type Of Plan"] = ""
+        plan_meta = {"message": f"Type Of Plan failed: {exc}", "matched": 0, "pan_rows": 0}
     if "Type Of Plan" not in joined.columns:
         joined["Type Of Plan"] = ""
     joined["Type Of Plan"] = joined["Type Of Plan"].fillna("").astype(str)
@@ -800,6 +802,7 @@ def assemble_fleet_table(
         if len(joined)
         else 0,
         "with_gps": int((joined["GPS KMs"] > 0).sum()) if len(joined) else 0,
+        "type_of_plan": plan_meta,
         "output_path": out_path,
         "needs_current_export": day_rows == 0,
         "base": "allocation_vehicles_then_uber_ola_rapido_gps",
