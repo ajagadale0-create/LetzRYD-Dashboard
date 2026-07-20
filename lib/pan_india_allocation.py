@@ -4,23 +4,29 @@ Required columns from live Google Sheet:
   - Date Of Allocation
   - Operator/Driver ID
   - Type Of Plan
-  - Vehicle Number
+  - Vehicle Number (header often Vehicle Num)
 
 Trick:
   key = Vehicle Number + Operator/Driver ID
   for a fleet row date D → take max Date Of Allocation <= D for that key
   → that row's Type Of Plan
 
+Fallbacks (only when primary key misses):
+  1) Driver Plan fills blank Type Of Plan on the sheet row
+  2) Vehicle-only as-of match
+  3) Partner-ID-only as-of match
+
 Data source: live Google Sheet auto-synced via service account (no manual Excel).
 """
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pandas as pd
 
-from lib.allocation import _norm_partner_id, _norm_vehicle
+from lib.allocation import _norm_partner_id
 from lib.paths import code_root, data_root
 
 SUPPORTED_SUFFIXES = {".xlsx", ".xls", ".csv"}
@@ -79,16 +85,48 @@ def list_pan_india_files(folder: Path | None = None) -> list[Path]:
     return sorted(candidates, key=lambda p: p.stat().st_mtime, reverse=True)
 
 
-def _normalize_text(value) -> str:
+def _trim(value) -> str:
+    """Aggressive trim for matching: spaces, NBSP, zero-width, tabs/newlines."""
     if pd.isna(value):
         return ""
-    text = str(value).strip()
+    text = str(value)
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00a0]", "", text)
+    text = text.strip()
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _norm_vehicle_key(value) -> str:
+    """KA-05-AN-9208 / ka 05 an 9208 → KA05AN9208 (trim + alphanum only)."""
+    text = _trim(value).upper()
+    if not text:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", text)
+
+
+def _norm_id_key(value) -> str:
+    """Trim + remove all internal spaces for Partner / Operator ID match."""
+    text = _trim(value).upper()
+    if not text:
+        return ""
+    text = re.sub(r"\s+", "", text)
+    if text.lower() in {"nan", "none", "null", "-", "rfd"}:
+        return ""
+    # Excel float leftovers: 9550473489.0
+    if re.fullmatch(r"\d+\.0+", text):
+        text = text.split(".", 1)[0]
+    return _norm_partner_id(text).strip().upper()
+
+
+def _normalize_text(value) -> str:
+    """Trim plan labels (Type Of Plan / Driver Plan)."""
+    text = _trim(value)
     return "" if text.lower() in {"nan", "none", "null", "nat", "-"} else text
 
 
 def _match_key(vehicle: str, partner_id: str) -> str:
-    # Uppercase ID so LETZ… / letz… always match
-    return f"{_norm_vehicle(vehicle)}|{_norm_partner_id(partner_id).upper()}"
+    """Match only on trimmed/normalized vehicle + id."""
+    return f"{_norm_vehicle_key(vehicle)}|{_norm_id_key(partner_id)}"
 
 
 def _pick_column(columns: list[str], *predicates) -> str | None:
@@ -146,11 +184,31 @@ def _map_required_columns(df: pd.DataFrame) -> dict[str, str]:
         mapping[plan_col] = "Type Of Plan"
     if veh_col:
         mapping[veh_col] = "Vehicle Number"
+
+    # Optional: some rows fill Driver Plan, not Type Of Plan
+    driver_plan_col = _pick_column(
+        cols,
+        lambda s: s == "driver plan",
+        lambda s: "driver" in s and "plan" in s and "type" not in s and "id" not in s,
+    )
+    if driver_plan_col and driver_plan_col not in mapping:
+        mapping[driver_plan_col] = "Driver Plan"
+
     return mapping
 
 
 def _score_sheet(df: pd.DataFrame) -> int:
-    return len(_map_required_columns(df))
+    vals = set(_map_required_columns(df).values())
+    return sum(
+        1
+        for c in (
+            "Date Of Allocation",
+            "Operator/Driver ID",
+            "Type Of Plan",
+            "Vehicle Number",
+        )
+        if c in vals
+    )
 
 
 def _read_pan_india_file(path: Path) -> pd.DataFrame:
@@ -187,12 +245,20 @@ def _read_pan_india_file(path: Path) -> pd.DataFrame:
             f"Found headers: {list(df.columns)}"
         )
 
-    out = df.rename(columns=mapping)[required].copy()
-    out["Vehicle Number"] = out["Vehicle Number"].map(_norm_vehicle)
-    out["Operator/Driver ID"] = out["Operator/Driver ID"].map(
-        lambda x: _norm_partner_id(x).upper()
-    )
+    keep = [c for c in required if c in mapped_vals]
+    if "Driver Plan" in mapped_vals:
+        keep.append("Driver Plan")
+    out = df.rename(columns=mapping)[keep].copy()
+
+    out["Vehicle Number"] = out["Vehicle Number"].map(_norm_vehicle_key)
+    out["Operator/Driver ID"] = out["Operator/Driver ID"].map(_norm_id_key)
     out["Type Of Plan"] = out["Type Of Plan"].map(_normalize_text)
+    if "Driver Plan" in out.columns:
+        out["Driver Plan"] = out["Driver Plan"].map(_normalize_text)
+        blank_plan = out["Type Of Plan"].eq("")
+        out.loc[blank_plan, "Type Of Plan"] = out.loc[blank_plan, "Driver Plan"]
+        out = out.drop(columns=["Driver Plan"])
+
     out["Date Of Allocation"] = pd.to_datetime(
         out["Date Of Allocation"], errors="coerce", dayfirst=True
     ).dt.normalize()
@@ -206,11 +272,14 @@ def _read_pan_india_file(path: Path) -> pd.DataFrame:
         _match_key(v, p)
         for v, p in zip(out["Vehicle Number"], out["Operator/Driver ID"])
     ]
+    out["_veh_key"] = out["Vehicle Number"]
+    out["_id_key"] = out["Operator/Driver ID"]
     out = (
         out.sort_values(["_key", "Date Of Allocation"])
         .drop_duplicates(["_key", "Date Of Allocation"], keep="last")
         .reset_index(drop=True)
     )
+    out.attrs["column_map"] = {v: k for k, v in mapping.items()}
     return out
 
 
@@ -263,6 +332,31 @@ def load_pan_india_allocation(
     }
 
 
+def _asof_plan_lookup(
+    left: pd.DataFrame,
+    right: pd.DataFrame,
+    *,
+    left_key: str,
+    right_key: str,
+) -> pd.Series:
+    """For each left row, plan from max Date Of Allocation <= _asof on matching key."""
+    if left.empty or right.empty:
+        return pd.Series(dtype=str)
+
+    joined = left.merge(
+        right.rename(columns={right_key: left_key}),
+        on=left_key,
+        how="inner",
+    )
+    joined = joined[joined["Date Of Allocation"] <= joined["_asof"]].copy()
+    if joined.empty:
+        return pd.Series(dtype=str)
+
+    joined = joined.sort_values(["_row", "Date Of Allocation"])
+    best = joined.groupby("_row", as_index=False).tail(1)
+    return best.set_index("_row")["Type Of Plan"].fillna("").astype(str)
+
+
 def attach_type_of_plan(
     fleet: pd.DataFrame,
     as_of_date: str | pd.Timestamp | None = None,
@@ -275,6 +369,8 @@ def attach_type_of_plan(
       key = Vehicle Number | Operator/Driver ID
       for fleet date D → max(Date Of Allocation) where Date Of Allocation <= D
       → that Type Of Plan
+
+    If primary key misses: vehicle-only, then partner-id-only (same as-of rule).
     """
     out = fleet.copy()
     if "Type Of Plan" not in out.columns:
@@ -283,6 +379,9 @@ def attach_type_of_plan(
     meta = {
         "pan_rows": 0,
         "matched": 0,
+        "matched_primary": 0,
+        "matched_vehicle": 0,
+        "matched_id": 0,
         "message": "",
     }
 
@@ -303,6 +402,24 @@ def attach_type_of_plan(
     meta["pan_rows"] = len(pan_df)
     meta["loaded_file"] = pan_meta.get("loaded_file", "")
 
+    # Allow callers/tests to pass a minimal pan_df without helper keys
+    if "_veh_key" not in pan_df.columns:
+        pan_df = pan_df.copy()
+        pan_df["_veh_key"] = pan_df.get(
+            "Vehicle Number", pd.Series("", index=pan_df.index)
+        ).map(_norm_vehicle_key)
+    if "_id_key" not in pan_df.columns:
+        pan_df = pan_df.copy()
+        pan_df["_id_key"] = pan_df.get(
+            "Operator/Driver ID", pd.Series("", index=pan_df.index)
+        ).map(_norm_id_key)
+    if "_key" not in pan_df.columns:
+        pan_df = pan_df.copy()
+        pan_df["_key"] = [
+            _match_key(v, p)
+            for v, p in zip(pan_df["_veh_key"], pan_df["_id_key"])
+        ]
+
     fallback = (
         pd.Timestamp(as_of_date).normalize()
         if as_of_date is not None
@@ -314,28 +431,28 @@ def attach_type_of_plan(
         asof = pd.Series(fallback, index=out.index)
     asof = pd.to_datetime(asof, errors="coerce").dt.normalize()
 
+    veh_series = out.get("Vehicle Number", pd.Series("", index=out.index)).fillna("")
+    pid_series = out.get("Partner ID", pd.Series("", index=out.index)).fillna("")
+
     left = pd.DataFrame(
         {
             "_row": out.index.astype(int),
-            "_key": [
-                _match_key(v, p)
-                for v, p in zip(
-                    out.get("Vehicle Number", pd.Series(dtype=str)).fillna(""),
-                    out.get("Partner ID", pd.Series(dtype=str)).fillna(""),
-                )
-            ],
+            "_key": [_match_key(v, p) for v, p in zip(veh_series, pid_series)],
+            "_veh_key": [_norm_vehicle_key(v) for v in veh_series],
+            "_id_key": [_norm_id_key(p) for p in pid_series],
             "_asof": asof,
         }
     )
-    left = left[left["_key"].ne("|") & left["_asof"].notna()].copy()
+    left = left[left["_asof"].notna()].copy()
 
-    right = pan_df[["_key", "Date Of Allocation", "Type Of Plan"]].copy()
+    right = pan_df[
+        ["_key", "_veh_key", "_id_key", "Date Of Allocation", "Type Of Plan"]
+    ].copy()
     right["Date Of Allocation"] = pd.to_datetime(
         right["Date Of Allocation"], errors="coerce"
     ).dt.normalize()
     right = right[
-        right["_key"].ne("|")
-        & right["Date Of Allocation"].notna()
+        right["Date Of Allocation"].notna()
         & right["Type Of Plan"].fillna("").astype(str).str.strip().ne("")
     ].copy()
 
@@ -343,26 +460,80 @@ def attach_type_of_plan(
         meta["message"] = "No valid Vehicle+ID keys to match Type Of Plan"
         return out, meta
 
-    # Same Vehicle+ID → keep plans with Date Of Allocation <= row Date,
-    # then pick highest past allocation date
-    joined = left.merge(right, on="_key", how="inner")
-    joined = joined[joined["Date Of Allocation"] <= joined["_asof"]].copy()
-    if joined.empty:
-        meta["message"] = (
-            f"Pan India rows={meta['pan_rows']} · no past Date Of Allocation match"
-        )
-        return out, meta
+    plan_map = pd.Series("", index=out.index, dtype=object)
+    match_how = pd.Series("", index=out.index, dtype=object)
 
-    joined = joined.sort_values(["_row", "Date Of Allocation"])
-    best = joined.groupby("_row", as_index=False).tail(1)
-    plan_map = best.set_index("_row")["Type Of Plan"].fillna("").astype(str)
-    out["Type Of Plan"] = out.index.map(lambda i: plan_map.get(i, "")).fillna("")
-    out["Type Of Plan"] = (
-        out["Type Of Plan"].astype(str).replace({"nan": "", "None": "", "NaT": ""})
+    primary = _asof_plan_lookup(
+        left[left["_key"].ne("|")],
+        right[["_key", "Date Of Allocation", "Type Of Plan"]],
+        left_key="_key",
+        right_key="_key",
+    )
+    for row_i, plan in primary.items():
+        if str(plan).strip():
+            plan_map.loc[row_i] = str(plan).strip()
+            match_how.loc[row_i] = "vehicle+id"
+    meta["matched_primary"] = int((match_how == "vehicle+id").sum())
+
+    still = plan_map.astype(str).str.strip().eq("")
+    if still.any():
+        left_veh = left[left["_row"].isin(out.index[still]) & left["_veh_key"].ne("")]
+        veh_plans = _asof_plan_lookup(
+            left_veh,
+            right[["_veh_key", "Date Of Allocation", "Type Of Plan"]],
+            left_key="_veh_key",
+            right_key="_veh_key",
+        )
+        for row_i, plan in veh_plans.items():
+            if still.loc[row_i] and str(plan).strip():
+                plan_map.loc[row_i] = str(plan).strip()
+                match_how.loc[row_i] = "vehicle"
+                still.loc[row_i] = False
+        meta["matched_vehicle"] = int((match_how == "vehicle").sum())
+
+    still = plan_map.astype(str).str.strip().eq("")
+    if still.any():
+        left_id = left[left["_row"].isin(out.index[still]) & left["_id_key"].ne("")]
+        id_plans = _asof_plan_lookup(
+            left_id,
+            right[["_id_key", "Date Of Allocation", "Type Of Plan"]],
+            left_key="_id_key",
+            right_key="_id_key",
+        )
+        for row_i, plan in id_plans.items():
+            if still.loc[row_i] and str(plan).strip():
+                plan_map.loc[row_i] = str(plan).strip()
+                match_how.loc[row_i] = "id"
+        meta["matched_id"] = int((match_how == "id").sum())
+
+    out["Type Of Plan"] = plan_map.reindex(out.index).fillna("").astype(str)
+    out["Type Of Plan"] = out["Type Of Plan"].map(_normalize_text)
+    out["Type Of Plan"] = out["Type Of Plan"].replace(
+        {"nan": "", "None": "", "NaT": ""}
     )
     meta["matched"] = int((out["Type Of Plan"].astype(str).str.strip() != "").sum())
+
+    blank_n = int(len(out) - meta["matched"])
+    sample_blank: list[str] = []
+    if blank_n:
+        blanks = out.loc[
+            out["Type Of Plan"].astype(str).str.strip().eq(""),
+            ["Vehicle Number", "Partner ID"],
+        ].head(5)
+        for _, r in blanks.iterrows():
+            sample_blank.append(
+                f"{_norm_vehicle_key(r.get('Vehicle Number', ''))}|"
+                f"{_norm_id_key(r.get('Partner ID', ''))}"
+            )
+        meta["blank_samples"] = sample_blank
+
     meta["message"] = (
         f"Pan India rows={meta['pan_rows']} · "
         f"Type Of Plan filled={meta['matched']}/{len(out)}"
+        f" (v+id={meta['matched_primary']}"
+        f", veh={meta['matched_vehicle']}"
+        f", id={meta['matched_id']})"
     )
+    if sample_blank:
+        meta["message"] += f" · blank e.g. {', '.join(sample_blank[:3])}"
     return out, meta
