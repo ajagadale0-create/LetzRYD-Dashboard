@@ -44,6 +44,12 @@ from lib.rapido_process import (
     list_rapido_files,
     rapido_dir,
 )
+from lib.partner_details import (
+    build_partner_status_table,
+    list_partner_detail_files,
+    load_partner_details,
+    partner_details_dir,
+)
 from lib.drive_sync import drive_configured, ensure_data_ready
 from lib.paths import data_root
 import plotly.express as px
@@ -53,8 +59,19 @@ st.set_page_config(
     page_title="AI Dashboard",
     page_icon="▣",
     layout="wide",
-    initial_sidebar_state="expanded",
+    initial_sidebar_state="auto",  # collapsed on phone, open on desktop
 )
+
+PLOTLY_CONFIG = {
+    "displayModeBar": False,
+    "responsive": True,
+    "scrollZoom": False,
+}
+
+
+def _show_plotly(fig) -> None:
+    st.plotly_chart(fig, use_container_width=True, config=PLOTLY_CONFIG)
+
 
 st.markdown(
     """
@@ -87,7 +104,11 @@ st.markdown(
         background: #D3E0D9;
         margin: 0.4rem 0 1.1rem;
       }
-      div[data-testid="stDataFrame"] { border: 1px solid #D3E0D9; border-radius: 12px; overflow: hidden; }
+      div[data-testid="stDataFrame"] {
+        border: 1px solid #D3E0D9;
+        border-radius: 12px;
+        overflow-x: auto;
+      }
       /* Compact filter row */
       div[data-testid="stHorizontalBlock"] div[data-testid="stSelectbox"] label {
         font-size: 0.72rem !important;
@@ -98,6 +119,59 @@ st.markdown(
       }
       div[data-testid="stHorizontalBlock"] div[data-baseweb="select"] > div {
         min-height: 2rem !important;
+      }
+      .js-plotly-plot, .plot-container { max-width: 100% !important; }
+
+      /* —— Mobile / narrow screens —— */
+      @media (max-width: 768px) {
+        .block-container {
+          padding-top: 0.7rem !important;
+          padding-left: 0.7rem !important;
+          padding-right: 0.7rem !important;
+          padding-bottom: 1.4rem !important;
+          max-width: 100% !important;
+        }
+        h1 { font-size: 1.35rem !important; line-height: 1.25 !important; }
+        h2, h3, [data-testid="stHeadingWithActionElements"] h2,
+        [data-testid="stHeadingWithActionElements"] h3 {
+          font-size: 1.05rem !important;
+        }
+        .stCaption, [data-testid="stCaptionContainer"] {
+          font-size: 0.72rem !important;
+          line-height: 1.35 !important;
+        }
+        .brand { font-size: 1.3rem; }
+        /* Filters wrap: 2 per row on tablet, full width on phone */
+        div[data-testid="stHorizontalBlock"] {
+          flex-wrap: wrap !important;
+          gap: 0.25rem 0.5rem !important;
+        }
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+          min-width: min(100%, 148px) !important;
+          flex: 1 1 148px !important;
+        }
+        /* Touch-friendly selects */
+        div[data-baseweb="select"] > div {
+          min-height: 2.4rem !important;
+        }
+        /* Tables scroll sideways instead of crushing */
+        div[data-testid="stDataFrame"] {
+          border-radius: 8px;
+        }
+        div[data-testid="stDataFrame"] [data-testid="stDataFrameResizable"] {
+          min-width: 100%;
+        }
+      }
+      @media (max-width: 560px) {
+        /* Charts + summaries stack full-width */
+        div[data-testid="stHorizontalBlock"] > div[data-testid="stColumn"] {
+          min-width: 100% !important;
+          flex: 1 1 100% !important;
+        }
+        /* Shorter plotly canvas on phones */
+        .js-plotly-plot .plotly {
+          max-height: 300px;
+        }
       }
     </style>
     """,
@@ -117,6 +191,8 @@ def current_data_fingerprint() -> str:
     parts = ["v26-run-on-mix", source_fingerprint(uber_root())]
     for path in list_allocation_files(allocation_dir()):
         parts.append(f"alloc:{_file_sig(path)}")
+    for path in list_partner_detail_files():
+        parts.append(f"partner:{_file_sig(path)}")
     for path in list_ola_files():
         parts.append(f"ola:{_file_sig(path)}")
     for path in list_gps_files():
@@ -154,6 +230,12 @@ def cached_gps_days(fingerprint: str):
 def cached_rapido_days(fingerprint: str):
     _ = fingerprint
     return build_rapido_vehicle_days(rapido_dir())
+
+
+@st.cache_data(show_spinner="Loading partner onboarding…", ttl=3600)
+def cached_partner_details(fingerprint: str):
+    _ = fingerprint
+    return load_partner_details()
 
 
 @st.cache_data(show_spinner="Reading available dates…", ttl=3600)
@@ -334,22 +416,30 @@ def _line_chart_with_labels(
 
     y_max = float(plot_df["Vehicles"].max()) if len(plot_df) else 0
     fig.update_layout(
-        height=320,
-        margin=dict(l=10, r=20, t=50, b=10),
+        autosize=True,
+        height=300,
+        margin=dict(l=4, r=8, t=48, b=8),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans", color="#1A2B24", size=11),
-        legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0, font=dict(size=10)),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.08,
+            x=0,
+            font=dict(size=10),
+            itemwidth=30,
+        ),
         xaxis=dict(gridcolor="#DCE6E1", tickangle=0, type="category", title=""),
         yaxis=dict(
             gridcolor="#DCE6E1",
             title="Vehicles",
             range=[0, y_max * 1.25 + 5],
         ),
-        uniformtext_minsize=10,
-        uniformtext_mode="show",
+        uniformtext_minsize=9,
+        uniformtext_mode="hide",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
 
 def _render_run_on_chart(trend: pd.DataFrame) -> None:
@@ -407,12 +497,20 @@ def _render_run_on_chart(trend: pd.DataFrame) -> None:
         hoverinfo="skip",
     )
     fig.update_layout(
-        height=360,
-        margin=dict(l=10, r=20, t=55, b=10),
+        autosize=True,
+        height=320,
+        margin=dict(l=4, r=8, t=52, b=8),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans", color="#1A2B24", size=11),
-        legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0, font=dict(size=11)),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.08,
+            x=0,
+            font=dict(size=10),
+            itemwidth=30,
+        ),
         xaxis=dict(gridcolor="#DCE6E1", tickangle=0, type="category", title=""),
         yaxis=dict(
             gridcolor="#DCE6E1",
@@ -421,7 +519,7 @@ def _render_run_on_chart(trend: pd.DataFrame) -> None:
         ),
         bargap=0.35,
     )
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
 
 def _render_ageing_chart(trend: pd.DataFrame) -> None:
@@ -502,22 +600,30 @@ def _render_revenue_deadmile_chart(trend: pd.DataFrame) -> None:
 
     y_max = float(plot_df["Amount"].max()) if len(plot_df) else 0
     fig.update_layout(
-        height=340,
-        margin=dict(l=10, r=20, t=50, b=10),
+        autosize=True,
+        height=300,
+        margin=dict(l=4, r=8, t=48, b=8),
         paper_bgcolor="rgba(0,0,0,0)",
         plot_bgcolor="rgba(0,0,0,0)",
         font=dict(family="DM Sans", color="#1A2B24", size=11),
-        legend=dict(orientation="h", yanchor="bottom", y=1.08, x=0, font=dict(size=10)),
+        legend=dict(
+            orientation="h",
+            yanchor="bottom",
+            y=1.08,
+            x=0,
+            font=dict(size=10),
+            itemwidth=30,
+        ),
         xaxis=dict(gridcolor="#DCE6E1", tickangle=0, type="category", title=""),
         yaxis=dict(
             gridcolor="#DCE6E1",
             title="Amount",
             range=[0, y_max * 1.25 + 5],
         ),
-        uniformtext_minsize=9,
-        uniformtext_mode="show",
+        uniformtext_minsize=8,
+        uniformtext_mode="hide",
     )
-    st.plotly_chart(fig, use_container_width=True)
+    _show_plotly(fig)
 
 
 def _month_label(start_date: str, end_date: str) -> str:
@@ -633,8 +739,9 @@ def _render_km_mix_pie(df: pd.DataFrame, *, period_label: str) -> None:
                 size=12, family="DM Sans", color=text_colors
             )
         fig.update_layout(
-            height=380,
-            margin=dict(l=8, r=8, t=8, b=8),
+            autosize=True,
+            height=320,
+            margin=dict(l=4, r=4, t=4, b=4),
             paper_bgcolor="rgba(0,0,0,0)",
             plot_bgcolor="rgba(0,0,0,0)",
             showlegend=False,
@@ -644,12 +751,12 @@ def _render_km_mix_pie(df: pd.DataFrame, *, period_label: str) -> None:
                     x=0.5,
                     y=0.5,
                     showarrow=False,
-                    font=dict(size=14, family="DM Sans", color="#1A2B24"),
+                    font=dict(size=13, family="DM Sans", color="#1A2B24"),
                     align="center",
                 )
             ],
         )
-        st.plotly_chart(fig, use_container_width=True)
+        _show_plotly(fig)
 
     with label_col:
         rows_html = []
@@ -987,7 +1094,8 @@ def _render_settings() -> None:
         f"**OLA:** `{ola_dir()}`  \n"
         f"**GPS:** `{gps_dir()}`  \n"
         f"**Rapido:** `{rapido_dir()}`  \n"
-        f"**Allocation:** `{allocation_dir()}`"
+        f"**Allocation:** `{allocation_dir()}`  \n"
+        f"**Partner onboarding:** `{partner_details_dir()}`"
     )
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
@@ -1063,15 +1171,206 @@ Heavy files download once, then only when changed.
 - Heavy data stays on **Google Drive** (not GitHub)
 - Local PC: uses `G:\\My Drive\\...` folders as before
 - Cloud: syncs into `.data_cache` then builds the same tables
+- Partner onboarding reader supports exported `.xlsx` / `.xls` / `.csv` files
         """
+    )
+
+
+def _render_partner_page(fp: str) -> None:
+    st.title("Partner")
+    st.caption(
+        "Active partners = onboarding IDs present in Vehicle Allocation Status on the latest available allocation date"
+    )
+
+    partner_df, partner_meta = cached_partner_details(fp)
+    alloc_df, _ = cached_allocation(fp)
+
+    if partner_meta.get("errors"):
+        st.error("Could not read onboarding details.")
+        for err in partner_meta["errors"]:
+            st.caption(err)
+        return
+
+    if partner_df.empty:
+        st.info(partner_meta.get("message", "No partner onboarding data found."))
+        if partner_meta.get("gsheet_files"):
+            st.caption(
+                "This folder currently has only Google Sheet shortcuts. Export the sheet as "
+                f"`.xlsx` or `.csv` into `{partner_details_dir()}` so the app can read it."
+            )
+        return
+
+    partner_view, status_meta = build_partner_status_table(partner_df, alloc_df)
+    if partner_view.empty:
+        st.info("No partner rows available after cleaning onboarding data.")
+        return
+
+    type_values = sorted(
+        {
+            str(v).strip()
+            for v in partner_view["Onboarding Type"].fillna("").tolist()
+            if str(v).strip()
+        }
+    )
+    city_values = sorted(
+        {str(v).strip() for v in partner_view["City"].fillna("").tolist() if str(v).strip()}
+    )
+
+    for key, default in (
+        ("partner_type", "All onboarding types"),
+        ("partner_city", "All cities"),
+        ("partner_status", "All status"),
+    ):
+        if key not in st.session_state:
+            st.session_state[key] = default
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        type_pick = st.selectbox(
+            "Onboarding Type",
+            options=["All onboarding types"] + type_values,
+            key="partner_type",
+        )
+    with c2:
+        city_pick = st.selectbox(
+            "City",
+            options=["All cities"] + city_values,
+            key="partner_city",
+        )
+    with c3:
+        status_pick = st.selectbox(
+            "Status",
+            options=["All status", "Active", "Inactive"],
+            key="partner_status",
+        )
+
+    view = partner_view.copy()
+    if type_pick != "All onboarding types":
+        view = view[view["Onboarding Type"] == type_pick]
+    if city_pick != "All cities":
+        view = view[view["City"] == city_pick]
+    if status_pick != "All status":
+        view = view[view["Partner Status"] == status_pick]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Allocation Date", status_meta.get("active_date", "") or "-")
+    m2.metric("Partner IDs", int(view["Partner ID"].nunique()) if not view.empty else 0)
+    m3.metric(
+        "Active",
+        int(view.loc[view["Partner Status"] == "Active", "Partner ID"].nunique())
+        if not view.empty
+        else 0,
+    )
+    m4.metric(
+        "Inactive",
+        int(view.loc[view["Partner Status"] == "Inactive", "Partner ID"].nunique())
+        if not view.empty
+        else 0,
+    )
+
+    st.caption(
+        f"Onboarding source: `{partner_meta.get('loaded_file', '')}` · "
+        f"folder: `{partner_details_dir()}`"
+    )
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+
+    age_order = ["< 25", "25-34", "35-44", "45-54", "55+", "Unknown"]
+    chart_df = (
+        view.groupby(["Ageing", "Partner Status"], as_index=False)
+        .agg(Partners=("Partner ID", "nunique"))
+        .copy()
+    )
+    if not chart_df.empty:
+        chart_df["Ageing"] = pd.Categorical(
+            chart_df["Ageing"], categories=age_order, ordered=True
+        )
+        chart_df = chart_df.sort_values(["Ageing", "Partner Status"])
+        fig = px.bar(
+            chart_df,
+            x="Ageing",
+            y="Partners",
+            color="Partner Status",
+            barmode="group",
+            text="Partners",
+            category_orders={"Ageing": age_order, "Partner Status": ["Active", "Inactive"]},
+            color_discrete_map={"Active": "#0F6E56", "Inactive": "#C45C26"},
+            labels={"Ageing": "Driver Age", "Partners": "Partner IDs"},
+        )
+        fig.update_traces(textposition="outside", cliponaxis=False)
+        fig.update_layout(
+            autosize=True,
+            height=320,
+            margin=dict(l=4, r=8, t=40, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0),
+            yaxis=dict(gridcolor="#DCE6E1", title="Partner IDs"),
+            xaxis=dict(title="Driver Age"),
+        )
+        _show_plotly(fig)
+    else:
+        st.info("No partner rows available for the selected filters.")
+
+    age_summary = (
+        view.groupby(["Ageing", "Partner Status"], as_index=False)
+        .agg(
+            **{
+                "Partner IDs": ("Partner ID", "nunique"),
+                "Drivers": ("Driver Name", "nunique"),
+            }
+        )
+        .copy()
+    )
+    if not age_summary.empty:
+        age_summary["Ageing"] = pd.Categorical(
+            age_summary["Ageing"], categories=age_order, ordered=True
+        )
+        age_summary = age_summary.sort_values(["Ageing", "Partner Status"]).reset_index(
+            drop=True
+        )
+
+    type_summary = (
+        view.groupby(["Onboarding Type", "Partner Status"], as_index=False)
+        .agg(
+            **{
+                "Partner IDs": ("Partner ID", "nunique"),
+                "Drivers": ("Driver Name", "nunique"),
+            }
+        )
+        .sort_values(["Onboarding Type", "Partner Status"])
+        .reset_index(drop=True)
+    )
+
+    s1, s2 = st.columns(2)
+    with s1:
+        st.subheader("Ageing summary")
+        st.dataframe(age_summary, use_container_width=True, hide_index=True, height=220)
+    with s2:
+        st.subheader("Onboarding summary")
+        st.dataframe(type_summary, use_container_width=True, hide_index=True, height=220)
+
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+    st.subheader("Partner detail")
+    st.caption("Filtered onboarding rows · only `Duplicate Check = Unique` are included")
+    st.dataframe(
+        view,
+        use_container_width=True,
+        hide_index=True,
+        height=520,
+        column_config={
+            "Partner ID": st.column_config.TextColumn("Partner ID"),
+            "Driver Name": st.column_config.TextColumn("Driver Name"),
+            "Driver Date of Birth": st.column_config.TextColumn("Driver DOB"),
+            "Driver Age": st.column_config.NumberColumn("Age", format="%d"),
+            "Partner Status": st.column_config.TextColumn("Status"),
+        },
     )
 
 
 def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     st.title("Fleet day table")
     st.caption(
-        "Uber date = Drop-off 4am→4am (file 15–16 → day 15) · "
-        "Ola / Rapido = calendar date · First load slow once, then cached"
+        "Uber = Drop-off 4am→4am · Ola / Rapido = calendar date · First load cached"
     )
 
     if not available_dates:
@@ -1167,16 +1466,18 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     if "day_type" not in st.session_state:
         st.session_state["day_type"] = "All types"
 
-    f1, f2, f3, f4, f5 = st.columns([1, 1, 1.1, 1.5, 1])
-    with f1:
+    # Filters: 2 rows so phones get usable controls (CSS also wraps)
+    r1a, r1b, r1c = st.columns(3)
+    with r1a:
         start_date = st.selectbox("Start", options=available_dates, key="day_start")
-    with f2:
+    with r1b:
         end_date = st.selectbox("End", options=available_dates, key="day_end")
-    with f3:
+    with r1c:
         city = st.selectbox("City", options=city_options, key="day_city")
-    with f4:
+    r2a, r2b = st.columns(2)
+    with r2a:
         partner = st.selectbox("Partner", options=partner_options, key="day_partner")
-    with f5:
+    with r2b:
         type_pick = st.selectbox("Type", options=type_options, key="day_type")
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
@@ -1267,12 +1568,12 @@ def main():
         )
         page = st.radio(
             "Navigate",
-            options=["Dashboard", "Settings"],
+            options=["Dashboard", "Partner", "Settings"],
             key="nav_page",
             label_visibility="collapsed",
         )
         st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
-        if page == "Dashboard" and st.button(
+        if page in {"Dashboard", "Partner"} and st.button(
             "Refresh data now", use_container_width=True
         ):
             st.cache_data.clear()
@@ -1292,6 +1593,10 @@ def main():
         return
 
     fp = current_data_fingerprint()
+    if page == "Partner":
+        _render_partner_page(fp)
+        return
+
     try:
         available_dates = load_available_dates(fp)
     except Exception:

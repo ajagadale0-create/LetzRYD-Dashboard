@@ -11,6 +11,7 @@ Secrets example (.streamlit/secrets.toml on Cloud):
 type = "service_account"
 project_id = "..."
 private_key_id = "..."
+# Use TOML multiline quotes for the PEM key (BEGIN…END PRIVATE KEY)
 private_key = "-----BEGIN PRIVATE KEY-----\\n...\\n-----END PRIVATE KEY-----\\n"
 client_email = "dashboard@....iam.gserviceaccount.com"
 client_id = "..."
@@ -48,6 +49,7 @@ SYNC_CHILDREN = {
     "GPS": "GPS",
     "Rapido": "Rapido",
     "Vehicle Allocation Status": "Vehicle Allocation Status",
+    "Allocation & Drop off form": "Allocation & Drop off form",
 }
 
 SKIP_NAME_PREFIXES = ("~$",)
@@ -79,18 +81,47 @@ def _secrets_dict() -> dict[str, Any]:
     }
 
 
+def _normalize_private_key(raw: Any) -> str:
+    """Fix common Streamlit-secrets paste issues for PEM private keys."""
+    key = str(raw).strip().strip('"').strip("'")
+    # TOML / JSON often store newlines as the two chars \n
+    if "\\n" in key and "-----BEGIN" in key:
+        key = key.replace("\\n", "\n")
+    key = key.replace("\r\n", "\n").replace("\r", "\n")
+    # Accidental double-escaping
+    while "\\n" in key and "BEGIN PRIVATE KEY" in key.split("\n", 1)[0]:
+        key = key.replace("\\n", "\n")
+    if "BEGIN PRIVATE KEY" not in key or "END PRIVATE KEY" not in key:
+        raise ValueError(
+            "Secrets private_key is incomplete. "
+            "In Streamlit Secrets, paste private_key with triple quotes "
+            '(see app Manage → Secrets help).'
+        )
+    return key
+
+
 def _drive_service():
     from google.oauth2 import service_account
     from googleapiclient.discovery import build
 
     info = _secrets_dict()["gcp"]
-    # st.secrets may expose AttrDict — normalize private_key newlines
     creds_info = {k: info[k] for k in info}
-    if "private_key" in creds_info:
-        creds_info["private_key"] = str(creds_info["private_key"]).replace("\\n", "\n")
-    creds = service_account.Credentials.from_service_account_info(
-        creds_info, scopes=SCOPES
-    )
+    if "private_key" not in creds_info:
+        raise ValueError(
+            "Missing gcp_service_account.private_key in Streamlit Secrets."
+        )
+    try:
+        creds_info["private_key"] = _normalize_private_key(creds_info["private_key"])
+        creds = service_account.Credentials.from_service_account_info(
+            creds_info, scopes=SCOPES
+        )
+    except Exception as exc:
+        raise ValueError(
+            "Google service-account private_key in Secrets is invalid. "
+            "Open the JSON key file, copy private_key again using triple quotes "
+            'in Secrets, e.g. private_key = """-----BEGIN...-----END...""". '
+            f"Detail: {type(exc).__name__}"
+        ) from None
     return build("drive", "v3", credentials=creds, cache_discovery=False)
 
 
@@ -140,6 +171,10 @@ def _walk_files(
                 continue
             _walk_files(service, item["id"], rel / name, out)
         else:
+            # Google Sheets: export to XLSX during sync (so importerange results are fetched).
+            if item.get("mimeType") == "application/vnd.google-apps.spreadsheet":
+                out.append((item, rel / name))
+                continue
             if _should_skip_file(name):
                 continue
             out.append((item, rel / name))
@@ -164,6 +199,24 @@ def _download_file(service, file_id: str, dest: Path) -> None:
 
     dest.parent.mkdir(parents=True, exist_ok=True)
     request = service.files().get_media(fileId=file_id, supportsAllDrives=True)
+    tmp = dest.with_suffix(dest.suffix + ".partial")
+    with open(tmp, "wb") as fh:
+        downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
+        done = False
+        while not done:
+            _, done = downloader.next_chunk()
+    tmp.replace(dest)
+
+
+def _export_spreadsheet_xlsx(service, file_id: str, dest: Path) -> None:
+    """Export a Drive Google Sheet as XLSX into dest."""
+    from googleapiclient.http import MediaIoBaseDownload
+
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    request = service.files().export(
+        fileId=file_id,
+        mimeType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+    )
     tmp = dest.with_suffix(dest.suffix + ".partial")
     with open(tmp, "wb") as fh:
         downloader = MediaIoBaseDownload(fh, request, chunksize=8 * 1024 * 1024)
@@ -230,15 +283,22 @@ def sync_drive_data(*, force: bool = False) -> dict:
         key = fid
         prev = meta.get(key, {})
         dest = dest_root / rel
-        need = force or not dest.exists() or prev.get("size") != size or prev.get("modifiedTime") != mtime
+        is_sheet = item.get("mimeType") == "application/vnd.google-apps.spreadsheet"
+        # Exported XLSX should overwrite the cached file.
+        if is_sheet:
+            dest = dest.with_suffix(".xlsx")
+        need = force or not dest.exists() or prev.get("modifiedTime") != mtime
         if not need:
             skipped += 1
             continue
         try:
-            _download_file(service, fid, dest)
+            if is_sheet:
+                _export_spreadsheet_xlsx(service, fid, dest)
+            else:
+                _download_file(service, fid, dest)
             meta[key] = {
                 "name": item.get("name"),
-                "path": str(rel).replace("\\", "/"),
+                "path": str(dest.relative_to(dest_root)).replace("\\", "/"),
                 "size": size,
                 "modifiedTime": mtime,
             }
