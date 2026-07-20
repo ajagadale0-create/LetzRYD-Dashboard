@@ -111,23 +111,31 @@ def _map_required_columns(df: pd.DataFrame) -> dict[str, str]:
         lambda s: "date" in s and "alloc" in s,
         lambda s: s in {"date of allocation", "allocation date"},
     )
+    # Prefer Operator/Driver ID — never pick "Driver Plan"
     id_col = _pick_column(
         cols,
-        lambda s: ("operator" in s or "driver" in s) and "id" in s,
-        lambda s: s in {"partner id", "partner ids", "id"},
-        lambda s: "operator/driver" in s,
+        lambda s: "operator" in s and "driver" in s and "id" in s,
+        lambda s: ("operator" in s or "driver" in s) and "id" in s and "plan" not in s,
+        lambda s: s in {"partner id", "partner ids"},
     )
+    # Prefer "Type Of Plan" — never pick "Driver Plan"
     plan_col = _pick_column(
         cols,
         lambda s: "type" in s and "plan" in s,
-        lambda s: s in {"plan type", "plan", "type of plan"},
-        lambda s: "plan" in s and "type" in s,
+        lambda s: s in {"plan type", "type of plan"},
     )
+
+    def _is_vehicle_col(s: str) -> bool:
+        if any(x in s for x in ("upload", "photo", "image", "file", "attach", "model")):
+            return False
+        if "vehicle" in s and any(x in s for x in ("num", "number", "no", "reg")):
+            return True
+        return s in {"vehicle number", "vehicle num", "vehicle no", "vehicle"}
+
     veh_col = _pick_column(
         cols,
-        lambda s: "vehicle" in s and ("number" in s or "no" in s or "num" in s),
-        lambda s: s in {"vehicle", "vehicle number", "vehicle no", "reg no", "registration"},
-        lambda s: "vehicle" in s,
+        lambda s: s in {"vehicle number", "vehicle num", "vehicle no"},
+        _is_vehicle_col,
     )
 
     if date_col:
@@ -336,19 +344,16 @@ def attach_type_of_plan(
         return out, meta
 
     # Same Vehicle+ID → keep plans with Date Of Allocation <= row Date,
-    # then pick highest past allocation date (avoids merge_asof sort errors)
-    joined = left.merge(right, on="_key", how="left")
-    joined = joined[
-        joined["Date Of Allocation"].isna()
-        | (joined["Date Of Allocation"] <= joined["_asof"])
-    ].copy()
+    # then pick highest past allocation date
+    joined = left.merge(right, on="_key", how="inner")
+    joined = joined[joined["Date Of Allocation"] <= joined["_asof"]].copy()
     if joined.empty:
         meta["message"] = (
             f"Pan India rows={meta['pan_rows']} · no past Date Of Allocation match"
         )
         return out, meta
 
-    joined = joined.sort_values(["_row", "Date Of Allocation"], na_position="first")
+    joined = joined.sort_values(["_row", "Date Of Allocation"])
     best = joined.groupby("_row", as_index=False).tail(1)
     plan_map = best.set_index("_row")["Type Of Plan"].fillna("").astype(str)
     out["Type Of Plan"] = out.index.map(lambda i: plan_map.get(i, "")).fillna("")
