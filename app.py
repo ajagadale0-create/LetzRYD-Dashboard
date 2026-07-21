@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v47-uber-4am-aware-end", source_fingerprint(uber_root())]
+    parts = ["v48-detail-from-to-range", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1394,10 +1394,14 @@ def _render_filtered_views(
     )
 
     st.subheader("Detail")
+    period = ""
+    if not view.empty and "From" in view.columns and "To" in view.columns:
+        period = f"{view['From'].iloc[0]} → {view['To'].iloc[0]}"
     st.caption(
-        "Date = allocation status day used for Partner ID · "
-        "Type Of Plan = closest past Pan India plan for Vehicle + Partner ID on that Date · "
-        "Totals = Uber + Ola + Rapido for selected Start→End range"
+        (f"Period **{period}** · " if period else "")
+        + "From/To = Start→End filter · "
+        "metrics (Revenue/Trips/KM) summed across that period · "
+        "Date = last allocation day in range (Partner ID / Type Of Plan as-of)"
     )
     dl1, dl2 = st.columns([1, 4])
     with dl1:
@@ -1454,7 +1458,9 @@ def _render_filtered_views(
         height=560,
         hide_index=True,
         column_config={
-            "Date": st.column_config.TextColumn("Date"),
+            "From": st.column_config.TextColumn("From"),
+            "To": st.column_config.TextColumn("To"),
+            "Date": st.column_config.TextColumn("Date (as-of)"),
             "Type Of Plan": st.column_config.TextColumn("Type Of Plan"),
             "Type": st.column_config.TextColumn("Type"),
             "Total Revenue": st.column_config.TextColumn("Total Revenue"),
@@ -2013,8 +2019,15 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     if "day_city" not in st.session_state:
         st.session_state["day_city"] = "All cities"
 
-    start_date = st.session_state["day_start"]
-    end_date = st.session_state["day_end"]
+    # Start / End / City first — table is built from these (both Start and End apply).
+    r1a, r1b, r1c = st.columns(3)
+    with r1a:
+        start_date = st.selectbox("Start", options=available_dates, key="day_start")
+    with r1b:
+        end_date = st.selectbox("End", options=available_dates, key="day_end")
+    with r1c:
+        city = st.selectbox("City", options=city_options, key="day_city")
+
     if end_date < start_date:
         start_date, end_date = end_date, start_date
         st.session_state["day_start"] = start_date
@@ -2058,11 +2071,10 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
         except Exception:
             pie_table = None
 
-    city_sel = st.session_state.get("day_city", "All cities")
     table_for_opts = table
-    if city_sel != "All cities" and "City" in table.columns:
+    if city != "All cities" and "City" in table.columns:
         table_for_opts = table[
-            table["City"].fillna("").astype(str).str.strip() == city_sel
+            table["City"].fillna("").astype(str).str.strip() == city
         ]
 
     partners = sorted(
@@ -2095,19 +2107,13 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     if "day_type" not in st.session_state:
         st.session_state["day_type"] = "All types"
 
-    # Filters: 2 rows so phones get usable controls (CSS also wraps)
-    r1a, r1b, r1c = st.columns(3)
-    with r1a:
-        start_date = st.selectbox("Start", options=available_dates, key="day_start")
-    with r1b:
-        end_date = st.selectbox("End", options=available_dates, key="day_end")
-    with r1c:
-        city = st.selectbox("City", options=city_options, key="day_city")
     r2a, r2b = st.columns(2)
     with r2a:
         partner = st.selectbox("Partner", options=partner_options, key="day_partner")
     with r2b:
         type_pick = st.selectbox("Type", options=type_options, key="day_type")
+
+    st.caption(f"Detail / summaries use **{start_date} → {end_date}** (Start and End).")
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 

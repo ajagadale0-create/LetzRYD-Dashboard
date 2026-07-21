@@ -13,6 +13,8 @@ from lib.rapido_process import build_rapido_vehicle_days, rapido_dir
 from lib.uber_process import build_uber_vehicle_days
 
 TABLE_COLS = [
+    "From",
+    "To",
     "Date",
     "Vehicle Number",
     "City",
@@ -757,6 +759,9 @@ def assemble_fleet_table(
     if "Date" not in joined.columns:
         joined["Date"] = end.strftime("%Y-%m-%d")
     joined["Date"] = joined["Date"].fillna(end.strftime("%Y-%m-%d")).astype(str)
+    # Filter window — Start and End both apply (metrics summed across From→To)
+    joined["From"] = start.strftime("%Y-%m-%d")
+    joined["To"] = end.strftime("%Y-%m-%d")
 
     joined = (
         joined[TABLE_COLS]
