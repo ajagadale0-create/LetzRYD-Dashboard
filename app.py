@@ -44,20 +44,6 @@ from lib.rapido_process import (
     list_rapido_files,
     rapido_dir,
 )
-from lib.partner_details import (
-    AGE_BUCKETS,
-    build_ageing_basket_summary,
-    build_monthly_partner_churn,
-    build_operator_vehicle_summary,
-    build_operator_vehicle_table,
-    build_partner_status_table,
-    list_partner_detail_files,
-    load_partner_details,
-    onboarding_type_options,
-    partner_details_dir,
-    sync_partner_sheet,
-    _normalize_onboarding_type,
-)
 from lib.pan_india_allocation import (
     list_pan_india_files,
     pan_india_dir,
@@ -65,7 +51,66 @@ from lib.pan_india_allocation import (
 from lib.drive_sync import drive_configured, ensure_data_ready
 from lib.paths import data_root
 import plotly.express as px
-import plotly.graph_objects as go
+
+# Partner helpers — soft import so Dashboard still loads if Partner module mismatches
+try:
+    from lib.partner_details import (
+        AGE_BUCKETS,
+        build_ageing_basket_summary,
+        build_operator_vehicle_summary,
+        build_operator_vehicle_table,
+        build_partner_status_table,
+        list_partner_detail_files,
+        load_partner_details,
+        onboarding_type_options,
+        partner_details_dir,
+        sync_partner_sheet,
+        _normalize_onboarding_type,
+    )
+
+    _PARTNER_IMPORT_ERROR = ""
+except Exception as _partner_exc:  # noqa: BLE001 — keep app alive on Cloud mismatch
+    _PARTNER_IMPORT_ERROR = f"{type(_partner_exc).__name__}: {_partner_exc}"
+    AGE_BUCKETS = ["< 25", "25-34", "35-44", "45-54", "55+", "Unknown"]
+
+    def list_partner_detail_files(folder=None):
+        return []
+
+    def partner_details_dir(base=None):
+        from lib.paths import data_root as _dr
+
+        return _dr() / "Allocation & Drop off form"
+
+    def load_partner_details(folder=None):
+        return __import__("pandas").DataFrame(), {
+            "message": _PARTNER_IMPORT_ERROR,
+            "errors": [_PARTNER_IMPORT_ERROR],
+        }
+
+    def sync_partner_sheet(*, force: bool = False):
+        return {"ok": False, "message": _PARTNER_IMPORT_ERROR}
+
+    def onboarding_type_options(values):
+        return []
+
+    def _normalize_onboarding_type(value):
+        return str(value or "").strip() or "Unknown"
+
+    def build_partner_status_table(partner_df, alloc_df, active_date=None):
+        return __import__("pandas").DataFrame(), {}
+
+    def build_ageing_basket_summary(view):
+        return __import__("pandas").DataFrame(
+            columns=["Ageing", "Active", "Inactive", "Total", "Active %"]
+        )
+
+    def build_operator_vehicle_summary(alloc_df, partner_view):
+        return __import__("pandas").DataFrame(
+            columns=["Vehicles", "Operators", "Active", "Inactive"]
+        )
+
+    def build_operator_vehicle_table(alloc_df, partner_view):
+        return __import__("pandas").DataFrame()
 
 
 st.set_page_config(
@@ -234,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v39-partner-churn-waterfall", source_fingerprint(uber_root())]
+    parts = ["v40-soft-partner-import", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1224,6 +1269,13 @@ Heavy files download once, then only when changed.
 
 def _render_partner_page(fp: str) -> None:
     st.title("Partner")
+    if _PARTNER_IMPORT_ERROR:
+        st.error(
+            "Partner module failed to import — push latest "
+            "`lib/partner_details.py` + `app.py`, then Reboot.\n\n"
+            f"`{_PARTNER_IMPORT_ERROR}`"
+        )
+        return
     st.caption(
         "Active partners = onboarding IDs present in Vehicle Allocation Status on the latest available allocation date"
     )
@@ -1325,116 +1377,129 @@ def _render_partner_page(fp: str) -> None:
     )
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
-    # Current-month churn / new-addition waterfall (allocation active IDs)
-    churn_steps, churn_meta = build_monthly_partner_churn(
-        alloc_df,
-        partner_df,
-        city=None if city_pick == "All cities" else city_pick,
-        onboarding_type=None
-        if type_pick == "All onboarding types"
-        else type_pick,
-    )
-    st.subheader(f"Driver movement · {churn_meta.get('month') or 'current month'}")
-    st.caption(
-        "Active Partner IDs on Vehicle Allocation Status · "
-        "Opening = last day before month (or first in-month day) · "
-        "Closing = latest day this month · "
-        "+New / −Churn between those two days"
-    )
-    if churn_steps.empty:
-        st.info(churn_meta.get("message") or "Not enough allocation days for waterfall.")
-    else:
-        wf1, wf2 = st.columns([1.6, 1])
-        with wf1:
-            measures = churn_steps["Measure"].tolist()
-            values = [float(v) for v in churn_steps["Value"].tolist()]
-            texts = []
-            for m, v in zip(measures, values):
-                if m == "relative" and v < 0:
-                    texts.append(str(int(v)))
-                elif m == "relative":
-                    texts.append(f"+{int(v)}")
-                else:
-                    texts.append(str(int(v)))
-            fig_wf = go.Figure(
-                go.Waterfall(
-                    name="Partners",
-                    orientation="v",
-                    measure=measures,
-                    x=churn_steps["Step"].tolist(),
-                    y=values,
-                    text=texts,
-                    textposition="outside",
-                    connector={"line": {"color": "#9BB0A8", "width": 1}},
-                    increasing={"marker": {"color": "#0F6E56"}},
-                    decreasing={"marker": {"color": "#C45C26"}},
-                    totals={"marker": {"color": "#1F3A34"}},
-                    hovertemplate="%{x}<br>%{text}<extra></extra>",
+    # Partner page only — current-month churn / new-addition waterfall
+    try:
+        from lib.partner_details import build_monthly_partner_churn
+        import plotly.graph_objects as go
+
+        churn_steps, churn_meta = build_monthly_partner_churn(
+            alloc_df,
+            partner_df,
+            city=None if city_pick == "All cities" else city_pick,
+            onboarding_type=None
+            if type_pick == "All onboarding types"
+            else type_pick,
+        )
+        st.subheader(
+            f"Driver movement · {churn_meta.get('month') or 'current month'}"
+        )
+        st.caption(
+            "Active Partner IDs on Vehicle Allocation Status · "
+            "Opening = last day before month (or first in-month day) · "
+            "Closing = latest day this month · "
+            "+New / −Churn between those two days"
+        )
+        if churn_steps.empty:
+            st.info(
+                churn_meta.get("message")
+                or "Not enough allocation days for waterfall."
+            )
+        else:
+            wf1, wf2 = st.columns([1.6, 1])
+            with wf1:
+                measures = churn_steps["Measure"].tolist()
+                values = [float(v) for v in churn_steps["Value"].tolist()]
+                texts = []
+                for m, v in zip(measures, values):
+                    if m == "relative" and v < 0:
+                        texts.append(str(int(v)))
+                    elif m == "relative":
+                        texts.append(f"+{int(v)}")
+                    else:
+                        texts.append(str(int(v)))
+                fig_wf = go.Figure(
+                    go.Waterfall(
+                        name="Partners",
+                        orientation="v",
+                        measure=measures,
+                        x=churn_steps["Step"].tolist(),
+                        y=values,
+                        text=texts,
+                        textposition="outside",
+                        connector={"line": {"color": "#9BB0A8", "width": 1}},
+                        increasing={"marker": {"color": "#0F6E56"}},
+                        decreasing={"marker": {"color": "#C45C26"}},
+                        totals={"marker": {"color": "#1F3A34"}},
+                        hovertemplate="%{x}<br>%{text}<extra></extra>",
+                    )
                 )
-            )
-            opening_v = float(churn_meta.get("opening") or 0)
-            closing_v = float(churn_meta.get("closing") or 0)
-            y_max = max([opening_v, closing_v] + [abs(v) for v in values] + [0])
-            fig_wf.update_layout(
-                autosize=True,
-                height=340,
-                margin=dict(l=4, r=8, t=28, b=8),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                showlegend=False,
-                yaxis=dict(
-                    gridcolor="#DCE6E1",
-                    title="Active Partner IDs",
-                    range=[0, y_max * 1.18 + 2],
-                ),
-                xaxis=dict(title=""),
-                font=dict(family="DM Sans", color="#0B1F18"),
-            )
-            _show_plotly(fig_wf)
-        with wf2:
-            st.caption("Month bridge")
-            st.dataframe(
-                pd.DataFrame(
-                    [
-                        {
-                            "Metric": "Opening active",
-                            "Date": churn_meta.get("opening_date", ""),
-                            "Partners": churn_meta.get("opening", 0),
-                        },
-                        {
-                            "Metric": "New additions",
-                            "Date": "",
-                            "Partners": churn_meta.get("new", 0),
-                        },
-                        {
-                            "Metric": "Churn",
-                            "Date": "",
-                            "Partners": churn_meta.get("churn", 0),
-                        },
-                        {
-                            "Metric": "Closing active",
-                            "Date": churn_meta.get("closing_date", ""),
-                            "Partners": churn_meta.get("closing", 0),
-                        },
-                        {
-                            "Metric": "Net change",
-                            "Date": "",
-                            "Partners": churn_meta.get("net", 0),
-                        },
-                    ]
-                ),
-                use_container_width=True,
-                hide_index=True,
-                height=280,
-                column_config={
-                    "Metric": st.column_config.TextColumn("Metric"),
-                    "Date": st.column_config.TextColumn("Date"),
-                    "Partners": st.column_config.NumberColumn(
-                        "Partners", format="localized"
+                opening_v = float(churn_meta.get("opening") or 0)
+                closing_v = float(churn_meta.get("closing") or 0)
+                y_max = max(
+                    [opening_v, closing_v] + [abs(v) for v in values] + [0]
+                )
+                fig_wf.update_layout(
+                    autosize=True,
+                    height=340,
+                    margin=dict(l=4, r=8, t=28, b=8),
+                    paper_bgcolor="rgba(0,0,0,0)",
+                    plot_bgcolor="rgba(0,0,0,0)",
+                    showlegend=False,
+                    yaxis=dict(
+                        gridcolor="#DCE6E1",
+                        title="Active Partner IDs",
+                        range=[0, y_max * 1.18 + 2],
                     ),
-                },
-            )
-            st.caption(str(churn_meta.get("message", "")))
+                    xaxis=dict(title=""),
+                    font=dict(family="DM Sans", color="#0B1F18"),
+                )
+                _show_plotly(fig_wf)
+            with wf2:
+                st.caption("Month bridge")
+                st.dataframe(
+                    pd.DataFrame(
+                        [
+                            {
+                                "Metric": "Opening active",
+                                "Date": churn_meta.get("opening_date", ""),
+                                "Partners": churn_meta.get("opening", 0),
+                            },
+                            {
+                                "Metric": "New additions",
+                                "Date": "",
+                                "Partners": churn_meta.get("new", 0),
+                            },
+                            {
+                                "Metric": "Churn",
+                                "Date": "",
+                                "Partners": churn_meta.get("churn", 0),
+                            },
+                            {
+                                "Metric": "Closing active",
+                                "Date": churn_meta.get("closing_date", ""),
+                                "Partners": churn_meta.get("closing", 0),
+                            },
+                            {
+                                "Metric": "Net change",
+                                "Date": "",
+                                "Partners": churn_meta.get("net", 0),
+                            },
+                        ]
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                    height=280,
+                    column_config={
+                        "Metric": st.column_config.TextColumn("Metric"),
+                        "Date": st.column_config.TextColumn("Date"),
+                        "Partners": st.column_config.NumberColumn(
+                            "Partners", format="localized"
+                        ),
+                    },
+                )
+                st.caption(str(churn_meta.get("message", "")))
+    except Exception as exc:
+        st.warning(f"Driver movement chart unavailable: {exc}")
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
