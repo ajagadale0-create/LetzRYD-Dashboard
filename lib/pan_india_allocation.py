@@ -101,6 +101,64 @@ def _normalize_text(value) -> str:
     return "" if text.lower() in {"nan", "none", "null", "nat", "-"} else text
 
 
+# Display names — one spelling pattern (hyphen spacing, no stray " Plan" suffix).
+_PLAN_CANON = {
+    "lip": "LIP",
+    "lip plan": "LIP",
+    "uber - tbs": "Uber - TBS",
+    "uber tbs": "Uber - TBS",
+    "ubertbs": "Uber - TBS",
+    "uber - ebs": "Uber - EBS",
+    "uber ebs": "Uber - EBS",
+    "uberebs": "Uber - EBS",
+    "rapido - fixed": "Rapido - Fixed",
+    "rapido fixed": "Rapido - Fixed",
+    "only uber": "Only Uber",
+    "fixed": "Fixed",
+    "d2o - fixed": "D2O - Fixed",
+    "d2o fixed": "D2O - Fixed",
+    "rfd": "RFD",
+    "(blank)": "RFD",
+    "blank": "RFD",
+}
+
+
+def canonical_type_of_plan(value, *, blank_as: str = "RFD") -> str:
+    """Consistent Type Of Plan label for charts / Detail.
+
+    - Empty / (Blank) → RFD (per ops)
+    - Unify dashes/spaces: Uber-TBS → Uber - TBS
+    - Drop trailing \" Plan\" so LIP Plan matches Uber - TBS / Fixed pattern
+    """
+    text = _normalize_text(value)
+    if not text:
+        return blank_as
+    text = text.replace("\u2013", "-").replace("\u2014", "-")
+    text = re.sub(r"\s*-\s*", " - ", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    key_full = text.casefold()
+    if key_full in _PLAN_CANON:
+        return _PLAN_CANON[key_full]
+    bare = re.sub(r"\s+plan$", "", text, flags=re.I).strip()
+    key = bare.casefold()
+    if key in _PLAN_CANON:
+        return _PLAN_CANON[key]
+    if not bare:
+        return blank_as
+    # Keep existing words; only force known acronyms upper
+    parts = []
+    for w in bare.split(" "):
+        if w.casefold() in {"lip", "tbs", "ebs", "d2o", "rfd", "ola"}:
+            parts.append(w.upper())
+        elif w.casefold() in {"uber", "rapido", "fixed", "only"}:
+            parts.append(w[:1].upper() + w[1:].lower())
+        elif w == "-":
+            parts.append("-")
+        else:
+            parts.append(w)
+    return " ".join(parts)
+
+
 def _norm_vehicle_key(value) -> str:
     """Same vehicle trim as allocation / Uber / OLA / GPS / Rapido."""
     return _norm_vehicle(value)
@@ -600,6 +658,11 @@ def attach_type_of_plan(
                 missing_in_sheet += 1
         meta["blank_samples"] = sample_blank
         meta["blank_not_in_sheet"] = missing_in_sheet
+
+    # Display spelling + blank → RFD (chart / Detail same labels)
+    out["Type Of Plan"] = out["Type Of Plan"].map(
+        lambda v: canonical_type_of_plan(v, blank_as="RFD")
+    )
 
     meta["message"] = (
         f"Pan India rows={meta['pan_rows']} · "

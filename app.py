@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v50-ignore-xcent-alloc-model", source_fingerprint(uber_root())]
+    parts = ["v51-type-of-plan-rfd-canon", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1004,15 +1004,20 @@ def _type_of_plan_summary(view: pd.DataFrame) -> pd.DataFrame:
     if view is None or view.empty or "Type Of Plan" not in view.columns:
         return pd.DataFrame(columns=cols)
 
+    try:
+        from lib.pan_india_allocation import canonical_type_of_plan
+    except Exception:
+        def canonical_type_of_plan(value, *, blank_as: str = "RFD") -> str:  # type: ignore
+            text = str(value or "").strip()
+            if not text or text.lower() in {"nan", "none", "(blank)", "blank"}:
+                return blank_as
+            return text
+
     work = view.copy()
-    plan = (
+    work["_plan"] = (
         work["Type Of Plan"]
-        .fillna("")
-        .astype(str)
-        .str.strip()
-        .replace({"nan": "", "None": "", "NaT": ""})
+        .map(lambda v: canonical_type_of_plan(v, blank_as="RFD"))
     )
-    work["_plan"] = plan.where(plan.ne(""), "(Blank)")
 
     agg_map: dict = {
         "Vehicles": ("Vehicle Number", "nunique"),
