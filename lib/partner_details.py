@@ -642,28 +642,28 @@ def build_monthly_partner_churn(
     steps = pd.DataFrame(
         [
             {
-                "Step": f"Opening\n{meta['opening_date']}",
+                "Step": "Opening",
                 "Measure": "absolute",
                 "Value": opening_n,
-                "Label": "Opening active",
+                "Label": f"Opening active ({meta['opening_date']})",
             },
             {
-                "Step": "New additions",
+                "Step": "+ New",
                 "Measure": "relative",
                 "Value": new_n,
-                "Label": "Joined / returned",
+                "Label": "Joined / returned this month",
             },
             {
-                "Step": "Churn",
+                "Step": "- Churn",
                 "Measure": "relative",
                 "Value": -churn_n,
-                "Label": "Dropped off",
+                "Label": "Dropped off this month",
             },
             {
-                "Step": f"Closing\n{meta['closing_date']}",
-                "Measure": "absolute",
+                "Step": "Closing",
+                "Measure": "total",
                 "Value": closing_n,
-                "Label": "Closing active",
+                "Label": f"Closing active ({meta['closing_date']})",
             },
         ]
     )
