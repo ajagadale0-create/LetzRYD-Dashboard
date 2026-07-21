@@ -20,6 +20,25 @@ ALLOC_COLS = [
     "Final Status",
 ]
 
+# Ignore these Vehicle Model values from Vehicle Allocation Status (all sources).
+IGNORED_VEHICLE_MODELS = {
+    "XCENT CRDI PRIME T BSIV",
+}
+
+
+def _norm_model(value) -> str:
+    if pd.isna(value):
+        return ""
+    text = str(value).strip().upper()
+    text = re.sub(r"\s+", " ", text)
+    if text.lower() in {"nan", "none", "null", "-"}:
+        return ""
+    return text
+
+
+def _is_ignored_vehicle_model(value) -> bool:
+    return _norm_model(value) in IGNORED_VEHICLE_MODELS
+
 
 def allocation_dir(base: Path | None = None) -> Path:
     if base is not None:
@@ -83,6 +102,8 @@ def _read_alloc_file(path: Path) -> pd.DataFrame:
         "dm name": "DM Name",
         "type": "Type",
         "final status": "Final Status",
+        "vehicle model": "Vehicle Model",
+        "model": "Vehicle Model",
     }
     for key, canon in wanted.items():
         if key in lower_map:
@@ -92,6 +113,11 @@ def _read_alloc_file(path: Path) -> pd.DataFrame:
     missing = [c for c in ("Vehicle Number", "Date") if c not in df.columns]
     if missing:
         raise KeyError(f"{path.name} missing columns: {missing}")
+
+    # Drop ignored models (e.g. XCENT CRDI PRIME T BSIV) before any joins.
+    if "Vehicle Model" in df.columns:
+        ignored = df["Vehicle Model"].map(_is_ignored_vehicle_model)
+        df = df.loc[~ignored].copy()
 
     keep = [c for c in ALLOC_COLS if c in df.columns]
     out = df[keep].copy()
@@ -246,6 +272,7 @@ def load_allocation(folder: Path | None = None) -> tuple[pd.DataFrame, dict]:
         "old_rows_kept": len(old_part),
         "current_rows_kept": len(current_part),
         "rule": "old Excel through its latest date; Current/GSheet from next day",
+        "ignored_vehicle_models": sorted(IGNORED_VEHICLE_MODELS),
     }
     return all_df, meta
 
