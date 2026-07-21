@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v44-type-of-plan-mix-today-only", source_fingerprint(uber_root())]
+    parts = ["v45-trends-end-at-latest", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -374,7 +374,9 @@ def load_available_dates(fingerprint: str) -> list[str]:
 
 
 @st.cache_data(show_spinner="Building Run On trend…")
-def load_run_on_trend(fingerprint: str, city: str = "All cities") -> pd.DataFrame:
+def load_run_on_trend(
+    fingerprint: str, city: str = "All cities", end_date: str = ""
+) -> pd.DataFrame:
     uber_days, _ = cached_uber_days(fingerprint)
     ola_days, _ = cached_ola_days(fingerprint)
     rapido_days, _ = cached_rapido_days(fingerprint)
@@ -383,6 +385,7 @@ def load_run_on_trend(fingerprint: str, city: str = "All cities") -> pd.DataFram
         uber_days,
         ola_days,
         last_n_days=7,
+        end_date=end_date or None,
         alloc=alloc,
         city=None if city == "All cities" else city,
         rapido_days=rapido_days,
@@ -390,7 +393,9 @@ def load_run_on_trend(fingerprint: str, city: str = "All cities") -> pd.DataFram
 
 
 @st.cache_data(show_spinner="Building Ageing trend…")
-def load_ageing_trend(fingerprint: str, city: str = "All cities") -> pd.DataFrame:
+def load_ageing_trend(
+    fingerprint: str, city: str = "All cities", end_date: str = ""
+) -> pd.DataFrame:
     uber_days, _ = cached_uber_days(fingerprint)
     ola_days, _ = cached_ola_days(fingerprint)
     alloc, _ = cached_allocation(fingerprint)
@@ -399,13 +404,14 @@ def load_ageing_trend(fingerprint: str, city: str = "All cities") -> pd.DataFram
         uber_days,
         ola_days,
         last_n_days=7,
+        end_date=end_date or None,
         city=None if city == "All cities" else city,
     )
 
 
 @st.cache_data(show_spinner="Building Revenue / Deadmile trend…")
 def load_revenue_deadmile_trend(
-    fingerprint: str, city: str = "All cities"
+    fingerprint: str, city: str = "All cities", end_date: str = ""
 ) -> pd.DataFrame:
     uber_days, _ = cached_uber_days(fingerprint)
     ola_days, _ = cached_ola_days(fingerprint)
@@ -417,6 +423,7 @@ def load_revenue_deadmile_trend(
         ola_days,
         gps_days,
         last_n_days=7,
+        end_date=end_date or None,
         city=None if city == "All cities" else city,
     )
 
@@ -540,12 +547,32 @@ def _line_chart_with_labels(
     _show_plotly(fig)
 
 
+def _trend_window_caption(trend: pd.DataFrame, *, detail: str) -> str:
+    """Caption with actual last-7 window from trend Date column."""
+    if trend is None or trend.empty or "Date" not in trend.columns:
+        return f"Last 7 days · {detail}"
+    days = sorted(
+        {
+            str(d)[:10]
+            for d in trend["Date"].dropna().astype(str).tolist()
+            if str(d).strip()
+        }
+    )
+    if not days:
+        return f"Last 7 days · {detail}"
+    return f"Last 7 days · {days[0]} → {days[-1]} · {detail}"
+
+
 def _render_run_on_chart(trend: pd.DataFrame) -> None:
     """One bar per day · OLA / Uber / Rapido / Mix stacked · visible labels."""
     if trend.empty:
         return
     st.subheader("Run On")
-    st.caption("Last 7 days · one bar per day · OLA / Uber / Rapido / Mix stacked")
+    st.caption(
+        _trend_window_caption(
+            trend, detail="one bar per day · OLA / Uber / Rapido / Mix stacked"
+        )
+    )
 
     plot_df = trend.copy()
     plot_df["Date"] = plot_df["Date"].map(_chart_day_label)
@@ -631,7 +658,10 @@ def _render_ageing_chart(trend: pd.DataFrame) -> None:
             "Not running": "#111111",
         },
         title="Ageing",
-        caption="Last 7 days · unique on-road vehicles · < 2500 / > 2500 / Not running",
+        caption=_trend_window_caption(
+            trend,
+            detail="unique on-road vehicles · < 2500 / > 2500 / Not running",
+        ),
     )
 
 
@@ -640,7 +670,10 @@ def _render_revenue_deadmile_chart(trend: pd.DataFrame) -> None:
         return
     st.subheader("Revenue & Deadmile Charges")
     st.caption(
-        "Last 7 days · Total Revenue · Deadmile Charges by type (Unproductive / Deadmile)"
+        _trend_window_caption(
+            trend,
+            detail="Total Revenue · Deadmile Charges by type (Unproductive / Deadmile)",
+        )
     )
 
     plot_df = trend.copy()
@@ -1994,16 +2027,22 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
+    # Last 7 days always end at selected End (defaults to latest available day).
+    # Independent of Start — Start/End range is for Detail / summaries only.
+    trend_end = end_date if end_date else (
+        available_dates[-1] if available_dates else ""
+    )
+
     try:
-        trend = load_run_on_trend(fp, city)
+        trend = load_run_on_trend(fp, city, trend_end)
     except Exception:
         trend = pd.DataFrame(columns=["Date", "Run On", "Vehicles"])
     try:
-        ageing_trend = load_ageing_trend(fp, city)
+        ageing_trend = load_ageing_trend(fp, city, trend_end)
     except Exception:
         ageing_trend = pd.DataFrame(columns=["Date", "Ageing", "Vehicles"])
     try:
-        rev_trend = load_revenue_deadmile_trend(fp, city)
+        rev_trend = load_revenue_deadmile_trend(fp, city, trend_end)
     except Exception:
         rev_trend = pd.DataFrame(columns=["Date", "Metric", "Amount"])
 
