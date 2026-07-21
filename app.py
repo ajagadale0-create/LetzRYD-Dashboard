@@ -232,7 +232,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v37-fast-boot-skip-heavy-sync", source_fingerprint(uber_root())]
+    parts = ["v38-partner-dob-dd-mmm-yy", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1336,7 +1336,12 @@ def _render_partner_page(fp: str) -> None:
     left, right = st.columns([1.35, 1])
     with left:
         st.subheader("Ageing basket")
-        st.caption("Driver age buckets · Active vs Inactive partner IDs")
+        st.caption(
+            "Driver age buckets · Active vs Inactive partner IDs · "
+            f"DOB parsed={status_meta.get('dob_parsed', 0)} · "
+            f"Unknown={status_meta.get('dob_unknown', 0)} "
+            "(blank / 1900 / unreadable DOB)"
+        )
         if not chart_long.empty:
             fig = px.bar(
                 chart_long,

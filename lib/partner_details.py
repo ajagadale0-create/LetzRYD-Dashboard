@@ -7,6 +7,7 @@ import re
 import tempfile
 import unicodedata
 import urllib.request
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -101,7 +102,70 @@ def _normalize_text(value) -> str:
     if pd.isna(value):
         return ""
     text = str(value).strip()
+    text = re.sub(r"[\u200b\u200c\u200d\ufeff\u00a0]", "", text)
     return "" if text.lower() in {"nan", "none", "null", "nat", "-"} else text
+
+
+def _parse_driver_dob(value) -> pd.Timestamp:
+    """
+    Partner sheet DOB is DD/MMM/YY (e.g. 05/Mar/95) or DD/MM/YYYY.
+    Also accepts ISO / Excel serial from Sheets→XLSX export.
+    """
+    if pd.isna(value):
+        return pd.NaT
+    if isinstance(value, pd.Timestamp):
+        ts = value.normalize() if pd.notna(value) else pd.NaT
+    elif hasattr(value, "year"):
+        try:
+            ts = pd.Timestamp(value).normalize()
+        except Exception:
+            ts = pd.NaT
+    else:
+        text = _normalize_text(value)
+        if not text:
+            return pd.NaT
+        ts = pd.NaT
+        for fmt in (
+            "%d/%b/%y",
+            "%d/%b/%Y",
+            "%d-%b-%y",
+            "%d-%b-%Y",
+            "%d %b %y",
+            "%d %b %Y",
+            "%d/%m/%Y",
+            "%d-%m-%Y",
+            "%d/%m/%y",
+            "%d-%m-%y",
+            "%Y-%m-%d",
+            "%Y/%m/%d",
+            "%Y-%m-%d %H:%M:%S",
+            "%Y-%m-%d %H:%M:%S.%f",
+        ):
+            try:
+                ts = pd.Timestamp(datetime.strptime(text, fmt)).normalize()
+                break
+            except ValueError:
+                continue
+        if pd.isna(ts) and re.fullmatch(r"\d+(\.\d+)?", text):
+            try:
+                serial = float(text)
+                if 20000 < serial < 80000:
+                    ts = (
+                        pd.Timestamp("1899-12-30") + pd.Timedelta(days=serial)
+                    ).normalize()
+            except (ValueError, OverflowError):
+                pass
+        if pd.isna(ts):
+            # dayfirst last — India dates; never prefer US MM/DD
+            parsed = pd.to_datetime(text, errors="coerce", dayfirst=True)
+            ts = pd.Timestamp(parsed).normalize() if pd.notna(parsed) else pd.NaT
+
+    if pd.isna(ts):
+        return pd.NaT
+    # Placeholder / junk years (e.g. 1900) → treat as missing
+    if ts.year < 1940 or ts.year > pd.Timestamp.today().year:
+        return pd.NaT
+    return ts
 
 
 ONBOARDING_TYPE_CANON = {
@@ -172,6 +236,14 @@ def _read_partner_file(path: Path) -> pd.DataFrame:
     for key, canon in wanted.items():
         if key in lower_map:
             rename[lower_map[key]] = canon
+
+    # Fuzzy DOB header if exact title didn't match
+    if "Driver Date of Birth" not in rename.values():
+        for low, raw in lower_map.items():
+            if "birth" in low or re.search(r"\bdob\b", low):
+                rename[raw] = "Driver Date of Birth"
+                break
+
     df = df.rename(columns=rename)
 
     required = [
@@ -193,9 +265,7 @@ def _read_partner_file(path: Path) -> pd.DataFrame:
     out = out[out["Duplicate Check"].str.casefold() == "unique"].copy()
     out["Partner ID"] = out["Partner ID"].map(_normalize_text).map(_norm_partner_id)
     out = out[out["Partner ID"] != ""].copy()
-    out["Driver DOB"] = pd.to_datetime(
-        out["Driver Date of Birth"], errors="coerce", dayfirst=True
-    ).dt.normalize()
+    out["Driver DOB"] = out["Driver Date of Birth"].map(_parse_driver_dob)
     out["Onboarding Type"] = out["Onboarding Type"].map(_normalize_onboarding_type)
     out["City"] = out["City"].replace("", "Unknown")
     out["Driver Name"] = out["Driver Name"].replace("", "Unknown")
@@ -258,6 +328,8 @@ def _age_bucket(age: float | int | None) -> str:
     if age is None or pd.isna(age):
         return "Unknown"
     age = int(age)
+    if age < 0 or age > 100:
+        return "Unknown"
     if age < 25:
         return AGE_BUCKETS[0]
     if age <= 34:
@@ -502,4 +574,6 @@ def build_partner_status_table(
         "inactive_partners": int(
             out.loc[out["Partner Status"] == "Inactive", "Partner ID"].nunique()
         ),
+        "dob_unknown": int((out["Ageing"] == "Unknown").sum()),
+        "dob_parsed": int((out["Ageing"] != "Unknown").sum()),
     }
