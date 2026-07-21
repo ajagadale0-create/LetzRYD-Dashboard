@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v45-trends-end-at-latest", source_fingerprint(uber_root())]
+    parts = ["v46-incremental-drive-sync", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1443,10 +1443,12 @@ def _render_settings() -> None:
         c1, c2 = st.columns(2)
         with c1:
             if st.button("Sync Drive now", type="primary", key="settings_sync_drive"):
-                info = ensure_data_ready(force=True, show_status=True)
+                # Incremental: only new/changed files (force=False). Full re-download hangs.
+                info = ensure_data_ready(force=False, show_status=True)
                 st.session_state["drive_sync_info"] = info
+                n = int(info.get("downloaded") or 0)
                 _clear_caches_and_reload(
-                    message="Drive synced + cache cleared — reloading…"
+                    message=f"Drive synced — {n} new/updated file(s) · reloading…"
                 )
         with c2:
             if st.button("Clear cache & reload", key="settings_clear_cache"):
@@ -1455,9 +1457,12 @@ def _render_settings() -> None:
         if info:
             st.caption(
                 f"Last sync · mode={info.get('mode')} · "
-                f"downloaded={info.get('downloaded')} · cached={info.get('skipped')}"
+                f"downloaded={info.get('downloaded')} · unchanged={info.get('skipped')}"
             )
-        st.caption(f"Cache nonce: {int(st.session_state.get('cache_nonce', 0))}")
+        st.caption(
+            "Sync pulls only new/changed Drive files. "
+            "Use sidebar Refresh after uploading today’s Uber/OLA CSVs."
+        )
     else:
         st.info(
             "Local mode (no Drive secrets). On Streamlit Cloud add Secrets so "
@@ -2125,7 +2130,21 @@ def main():
         if page in {"Dashboard", "Partner"} and st.button(
             "Refresh data now", use_container_width=True, key="sidebar_refresh"
         ):
-            _clear_caches_and_reload(message="Refreshed — data reloading…")
+            # Pull any new/changed Drive files, then rebuild tables from disk.
+            msg = "Refreshed — data reloading…"
+            if drive_configured():
+                try:
+                    info = ensure_data_ready(force=False, show_status=False)
+                    st.session_state["drive_sync_info"] = info
+                    n = int(info.get("downloaded") or 0)
+                    msg = (
+                        f"Refreshed — {n} new/updated file(s) from Drive"
+                        if n
+                        else "Refreshed — Drive checked, no new files · reloading…"
+                    )
+                except Exception as exc:
+                    msg = f"Drive check failed ({exc}) — reloading local cache…"
+            _clear_caches_and_reload(message=msg)
 
     if page == "Settings":
         _render_settings()
