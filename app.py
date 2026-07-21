@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v46-incremental-drive-sync", source_fingerprint(uber_root())]
+    parts = ["v47-uber-4am-aware-end", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -570,7 +570,8 @@ def _render_run_on_chart(trend: pd.DataFrame) -> None:
     st.subheader("Run On")
     st.caption(
         _trend_window_caption(
-            trend, detail="one bar per day · OLA / Uber / Rapido / Mix stacked"
+            trend,
+            detail="Uber 4am→4am · one bar/day · OLA / Uber / Rapido / Mix",
         )
     )
 
@@ -793,6 +794,70 @@ def _resolve_today_date(available_dates: list[str]) -> tuple[str, bool]:
     return today, False
 
 
+def _latest_uber_business_day(fingerprint: str = "") -> str:
+    """Latest Uber Drop-off 4am→4am business day from cached days or PT/Trip scan."""
+    if fingerprint:
+        try:
+            days, meta = cached_uber_days(fingerprint)
+            if meta and meta.get("date_to"):
+                return str(meta["date_to"])[:10]
+            if days is not None and not days.empty and "Date" in days.columns:
+                return pd.Timestamp(days["Date"].max()).strftime("%Y-%m-%d")
+        except Exception:
+            pass
+    try:
+        dates = available_pt_business_dates()
+        return str(dates[-1]) if dates else ""
+    except Exception:
+        return ""
+
+
+def _uber_aware_end(
+    selected_end: str, uber_max: str, *, max_lag_days: int = 2
+) -> str:
+    """Clamp End back to latest Uber biz day when calendar End is only 1–2 days ahead.
+
+    Uber day = Drop-off 04:00 → next day 04:00.
+    File 19–20 with drop-offs at 20 03:xx → business day **19**.
+    Allocation/calendar End on 20/21 then looks like Uber is missing — clamp for
+    trends / default so the last bar is a real Uber day.
+    """
+    if not selected_end:
+        return uber_max or ""
+    if not uber_max:
+        return selected_end
+    try:
+        end_ts = pd.Timestamp(selected_end).normalize()
+        uber_ts = pd.Timestamp(uber_max).normalize()
+    except Exception:
+        return selected_end
+    lag = int((end_ts - uber_ts).days)
+    if 1 <= lag <= max_lag_days:
+        return uber_max
+    return selected_end
+
+
+def _uber_lag_note(selected_end: str, uber_max: str) -> str:
+    if not selected_end or not uber_max or selected_end <= uber_max:
+        return ""
+    try:
+        lag = int(
+            (
+                pd.Timestamp(selected_end).normalize()
+                - pd.Timestamp(uber_max).normalize()
+            ).days
+        )
+    except Exception:
+        lag = 0
+    if lag <= 0:
+        return ""
+    return (
+        f"Uber = Drop-off 4am→4am · latest Uber day **{uber_max}** "
+        f"(file D→D+1 counts as day D). End **{selected_end}** is ahead — "
+        f"Uber for that End day is blank until the next PT/Trip file."
+    )
+
+
 def _render_km_mix_pie(df: pd.DataFrame, *, period_label: str) -> None:
     """Pie on left · full labels on right (Unproductive always listed)."""
     st.subheader("KM mix")
@@ -1003,16 +1068,20 @@ def _render_type_of_plan_mix(
     """Dashboard: Type Of Plan mix for today only (not Start→End range)."""
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
     day, is_today = _resolve_today_date(available_dates)
+    uber_max = _latest_uber_business_day(fp)
+    # Prefer Uber 4am business day when calendar today is ahead (no Uber yet).
+    day = _uber_aware_end(day, uber_max) or day
     st.subheader("Type Of Plan mix")
-    if is_today:
+    if is_today and day == pd.Timestamp.today().normalize().strftime("%Y-%m-%d"):
         st.caption(
             f"Today only ({day}) · City / Partner / Type filters apply · "
             "not the Start→End range"
         )
     else:
         st.caption(
-            f"Latest available day ({day}) — today not in data yet · "
-            "City / Partner / Type filters apply · not the Start→End range"
+            f"Ops day {day} · Uber 4am→4am aware"
+            + (f" · Uber through {uber_max}" if uber_max else "")
+            + " · City / Partner / Type filters apply · not the Start→End range"
         )
 
     view = pd.DataFrame()
@@ -1904,8 +1973,11 @@ def _render_partner_page(fp: str) -> None:
 
 def _render_dashboard(fp: str, available_dates: list[str]) -> None:
     st.title("Fleet day table")
+    uber_max = _latest_uber_business_day(fp)
     st.caption(
-        "Uber = Drop-off 4am→4am · Ola / Rapido = calendar date · First load cached"
+        "Uber = Drop-off **4am→4am** (file 19–20 → business day 19) · "
+        "Ola / Rapido = calendar date"
+        + (f" · Uber through **{uber_max}**" if uber_max else "")
     )
 
     if not available_dates:
@@ -1913,6 +1985,9 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
         return
 
     default_end = available_dates[-1]
+    # Land on latest Uber biz day when calendar End is only 1–2 days ahead (4am lag).
+    if uber_max and uber_max in available_dates:
+        default_end = _uber_aware_end(default_end, uber_max)
     default_start = available_dates[max(0, len(available_dates) - 10)]
 
     for key, default in (("day_start", default_start), ("day_end", default_end)):
@@ -1944,6 +2019,10 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
         start_date, end_date = end_date, start_date
         st.session_state["day_start"] = start_date
         st.session_state["day_end"] = end_date
+
+    lag_note = _uber_lag_note(end_date, uber_max)
+    if lag_note:
+        st.info(lag_note)
 
     try:
         table, _meta = load_range_table(start_date, end_date, fp)
@@ -2032,10 +2111,11 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
-    # Last 7 days always end at selected End (defaults to latest available day).
-    # Independent of Start — Start/End range is for Detail / summaries only.
-    trend_end = end_date if end_date else (
-        available_dates[-1] if available_dates else ""
+    # Last 7 days: Uber-aware end (4am→4am). If End is calendar-ahead of Uber,
+    # clamp so the last bar is the latest Uber business day.
+    trend_end = _uber_aware_end(
+        end_date if end_date else (available_dates[-1] if available_dates else ""),
+        uber_max,
     )
 
     try:
