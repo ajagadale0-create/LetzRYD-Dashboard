@@ -582,16 +582,21 @@ def build_monthly_partner_churn(
         return empty, meta
 
     allowed_ids: set[str] | None = None
-    if partner_df is not None and not partner_df.empty and onboarding_type:
-        if onboarding_type not in {"All onboarding types", ""}:
-            pdf = partner_df.copy()
+    # Same universe as Ageing Active: only Unique onboarding Partner IDs
+    if partner_df is not None and not partner_df.empty and "Partner ID" in partner_df.columns:
+        pdf = partner_df.copy()
+        if onboarding_type and onboarding_type not in {"All onboarding types", ""}:
             if "Onboarding Type" in pdf.columns:
                 pdf["_ot"] = pdf["Onboarding Type"].map(_normalize_onboarding_type)
-                allowed_ids = {
-                    _norm_partner_id(v)
-                    for v, ot in zip(pdf["Partner ID"], pdf["_ot"])
-                    if ot == onboarding_type and _norm_partner_id(v)
-                }
+                pdf = pdf[pdf["_ot"] == onboarding_type]
+        allowed_ids = {
+            _norm_partner_id(v)
+            for v in pdf["Partner ID"].fillna("").tolist()
+            if _norm_partner_id(v)
+        }
+        if not allowed_ids:
+            meta["message"] = "No onboarding Partner IDs for selected filters"
+            return empty, meta
 
     all_dates = sorted(work["_d"].unique())
     prior = [d for d in all_dates if d < month_start]
@@ -634,7 +639,7 @@ def build_monthly_partner_churn(
             "churn_ids": sorted(churn_ids),
             "message": (
                 f"{meta['month']}: open {opening_n} -> +{new_n} new -{churn_n} churn "
-                f"= {closing_n} (net {net:+d})"
+                f"= {closing_n} (net {net:+d}) · onboarding Unique IDs only"
             ),
         }
     )
@@ -695,19 +700,21 @@ def build_partner_status_table(
             active_ts = pd.Timestamp(active_date).normalize()
         day = alloc[pd.to_datetime(alloc["Date"], errors="coerce") == active_ts].copy()
         active_ids = {
-            str(v).strip()
+            _norm_partner_id(v)
             for v in day.get("partner IDs", pd.Series(dtype=str)).fillna("").tolist()
-            if str(v).strip() and str(v).strip().upper() != "RFD"
+            if _norm_partner_id(v) and _norm_partner_id(v) != "RFD"
         }
 
     out = partner_df.copy()
+    out["Partner ID"] = out["Partner ID"].map(_norm_partner_id)
+    out = out[out["Partner ID"] != ""].copy()
     asof = active_ts.normalize() if pd.notna(active_ts) else pd.Timestamp.today().normalize()
     age_years = ((asof - out["Driver DOB"]).dt.days / 365.25).floordiv(1)
     out["Driver Age"] = age_years.where(out["Driver DOB"].notna())
     out["Driver Age"] = out["Driver Age"].astype("Int64")
     out["Ageing"] = out["Driver Age"].map(_age_bucket)
     out["Partner Status"] = out["Partner ID"].map(
-        lambda pid: "Active" if str(pid).strip() in active_ids else "Inactive"
+        lambda pid: "Active" if pid in active_ids else "Inactive"
     )
     out["Active Date"] = (
         pd.Timestamp(active_ts).strftime("%Y-%m-%d") if pd.notna(active_ts) else ""

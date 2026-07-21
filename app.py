@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v41-real-waterfall-chart", source_fingerprint(uber_root())]
+    parts = ["v42-waterfall-onboarding-ids-only", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1394,9 +1394,8 @@ def _render_partner_page(fp: str) -> None:
             f"Driver movement · {churn_meta.get('month') or 'current month'}"
         )
         st.caption(
-            "Active Partner IDs on Vehicle Allocation Status · "
-            "Opening = last day before month (or first in-month day) · "
-            "Closing = latest day this month · "
+            "Unique onboarding Partner IDs only (same as Ageing Active) · "
+            "Opening = last day before month · Closing = latest day this month · "
             "+New / −Churn between those two days"
         )
         if churn_steps.empty:
