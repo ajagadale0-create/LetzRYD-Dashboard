@@ -78,25 +78,47 @@ def uber_business_date_series(series: pd.Series) -> pd.Series:
 
 
 def list_csvs(folder: Path) -> list[Path]:
-    files = sorted(folder.glob("*.csv"))
+    """Non-empty CSVs only — a 0-byte Drive upload breaks pandas ('No columns to parse')."""
+    files = []
+    for path in sorted(folder.glob("*.csv")):
+        try:
+            if path.stat().st_size > 0:
+                files.append(path)
+        except OSError:
+            continue
     if not files:
         raise FileNotFoundError(f"No CSV found in {folder}")
     return files
 
 
 def _read_csv_usecols(path: Path, wanted: list[str]) -> pd.DataFrame:
-    header = list(pd.read_csv(path, nrows=0).columns)
+    try:
+        if path.stat().st_size <= 0:
+            return pd.DataFrame(columns=wanted)
+        header = list(pd.read_csv(path, nrows=0).columns)
+    except (pd.errors.EmptyDataError, ValueError, OSError):
+        return pd.DataFrame(columns=wanted)
     usecols = [c for c in wanted if c in header]
-    return pd.read_csv(path, dtype=str, usecols=usecols)
+    if not usecols:
+        return pd.DataFrame(columns=wanted)
+    try:
+        return pd.read_csv(path, dtype=str, usecols=usecols)
+    except (pd.errors.EmptyDataError, ValueError):
+        return pd.DataFrame(columns=wanted)
 
 
 def _read_concat_csvs(folder: Path, wanted: list[str]) -> tuple[pd.DataFrame, list[str]]:
-    """Read every CSV in folder (only needed columns) and stack rows."""
+    """Read every non-empty CSV in folder (only needed columns) and stack rows."""
     frames: list[pd.DataFrame] = []
     names: list[str] = []
     for path in list_csvs(folder):
-        frames.append(_read_csv_usecols(path, wanted))
+        frame = _read_csv_usecols(path, wanted)
+        if frame.empty and not list(frame.columns):
+            continue
+        frames.append(frame)
         names.append(path.name)
+    if not frames:
+        return pd.DataFrame(columns=wanted), []
     return pd.concat(frames, ignore_index=True), names
 
 
@@ -255,7 +277,7 @@ def _cache_dir(base: Path | None = None) -> Path:
 def build_uber_vehicle_days(base: Path | None = None) -> tuple[pd.DataFrame, dict]:
     """Vehicle × Uber business day metrics (Drop-off 4am day). Cached on disk."""
     fp = source_fingerprint(base)
-    cache_key = hashlib.md5(f"v2-dropoff-4am|{fp}".encode("utf-8")).hexdigest()[:16]
+    cache_key = hashlib.md5(f"v3-skip-empty-csv|{fp}".encode("utf-8")).hexdigest()[:16]
     cache_path = _cache_dir(base) / f"uber_vehicle_days_{cache_key}.parquet"
     meta_path = _cache_dir(base) / f"uber_vehicle_days_{cache_key}.json"
 
@@ -435,15 +457,23 @@ def available_pt_business_dates(base: Path | None = None) -> list[str]:
     dates: set[str] = set()
     try:
         for path in list_csvs(root / "Trip"):
-            series = pd.read_csv(path, dtype=str, usecols=["Trip drop-off time"])[
-                "Trip drop-off time"
-            ]
+            try:
+                series = pd.read_csv(path, dtype=str, usecols=["Trip drop-off time"])[
+                    "Trip drop-off time"
+                ]
+            except (pd.errors.EmptyDataError, ValueError, KeyError):
+                continue
             dates.update(d for d in uber_business_date_series(series).tolist() if d)
     except Exception:
         pass
     try:
         for path in list_csvs(root / "PT"):
-            series = pd.read_csv(path, dtype=str, usecols=["vs reporting"])["vs reporting"]
+            try:
+                series = pd.read_csv(path, dtype=str, usecols=["vs reporting"])[
+                    "vs reporting"
+                ]
+            except (pd.errors.EmptyDataError, ValueError, KeyError):
+                continue
             dates.update(d for d in uber_business_date_series(series).tolist() if d)
     except Exception:
         pass
@@ -460,7 +490,11 @@ def source_fingerprint(base: Path | None = None) -> str:
             continue
         for path in sorted(folder.glob("*.csv")):
             try:
-                parts.append(f"{path.name}:{path.stat().st_size}")
+                size = int(path.stat().st_size)
+                if size <= 0:
+                    parts.append(f"{path.name}:empty")
+                    continue
+                parts.append(f"{path.name}:{size}")
             except OSError:
                 parts.append(f"{path.name}:missing")
     return "|".join(parts) if parts else "empty"

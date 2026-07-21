@@ -309,11 +309,27 @@ def sync_drive_data(*, force: bool = False) -> dict:
         if not need:
             skipped += 1
             continue
+        # Skip empty Drive files — they crash pandas ("No columns to parse from file")
+        if not is_sheet:
+            try:
+                if int(size or "0") <= 0:
+                    errors.append(f"{rel}: skipped empty file (0 bytes)")
+                    continue
+            except Exception:
+                pass
         try:
             if is_sheet:
                 _export_spreadsheet_xlsx(service, fid, dest)
             else:
                 _download_file(service, fid, dest)
+            # If download somehow produced an empty CSV, remove it and don't cache as good.
+            if dest.exists() and dest.suffix.lower() == ".csv" and dest.stat().st_size <= 0:
+                try:
+                    dest.unlink()
+                except OSError:
+                    pass
+                errors.append(f"{rel}: downloaded empty file — removed")
+                continue
             meta[key] = {
                 "name": item.get("name"),
                 "path": str(dest.relative_to(dest_root)).replace("\\", "/"),
