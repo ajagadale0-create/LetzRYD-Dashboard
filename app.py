@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v42-waterfall-onboarding-ids-only", source_fingerprint(uber_root())]
+    parts = ["v43-type-of-plan-mix-dashboard", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -887,6 +887,153 @@ def _render_km_mix_pie(df: pd.DataFrame, *, period_label: str) -> None:
         st.markdown("".join(rows_html), unsafe_allow_html=True)
 
 
+def _type_of_plan_summary(view: pd.DataFrame) -> pd.DataFrame:
+    """Vehicle / partner / revenue mix by Type Of Plan."""
+    cols = ["Type Of Plan", "Vehicles", "Partners", "Total Revenue", "Share %"]
+    if view is None or view.empty or "Type Of Plan" not in view.columns:
+        return pd.DataFrame(columns=cols)
+
+    work = view.copy()
+    plan = (
+        work["Type Of Plan"]
+        .fillna("")
+        .astype(str)
+        .str.strip()
+        .replace({"nan": "", "None": "", "NaT": ""})
+    )
+    work["_plan"] = plan.where(plan.ne(""), "(Blank)")
+
+    agg_map: dict = {
+        "Vehicles": ("Vehicle Number", "nunique"),
+    }
+    if "Partner ID" in work.columns:
+        work["_pid"] = (
+            work["Partner ID"]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace({"nan": "", "None": ""})
+        )
+        agg_map["Partners"] = ("_pid", lambda s: int(s[s.ne("")].nunique()))
+    if "Total Revenue" in work.columns:
+        agg_map["Total Revenue"] = ("Total Revenue", "sum")
+
+    out = work.groupby("_plan", as_index=False).agg(**agg_map)
+    out = out.rename(columns={"_plan": "Type Of Plan"})
+    if "Partners" not in out.columns:
+        out["Partners"] = 0
+    if "Total Revenue" not in out.columns:
+        out["Total Revenue"] = 0.0
+    out["Total Revenue"] = out["Total Revenue"].fillna(0.0).astype(float)
+    total_veh = int(out["Vehicles"].sum()) if len(out) else 0
+    out["Share %"] = out["Vehicles"].map(
+        lambda v: round(100.0 * float(v) / total_veh, 1) if total_veh else 0.0
+    )
+    out = out.sort_values(
+        ["Vehicles", "Total Revenue"], ascending=[False, False]
+    ).reset_index(drop=True)
+
+    total_row = pd.DataFrame(
+        [
+            {
+                "Type Of Plan": "Total",
+                "Vehicles": total_veh,
+                "Partners": int(out["Partners"].sum()),
+                "Total Revenue": float(out["Total Revenue"].sum()),
+                "Share %": 100.0 if total_veh else 0.0,
+            }
+        ]
+    )
+    return pd.concat([out, total_row], ignore_index=True)
+
+
+def _render_type_of_plan_mix(view: pd.DataFrame) -> None:
+    """Dashboard: Type Of Plan wise mix for current filtered fleet table."""
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
+    end_lbl = str(st.session_state.get("day_end") or "")
+    start_lbl = str(st.session_state.get("day_start") or "")
+    st.subheader("Type Of Plan mix")
+    st.caption(
+        "Vehicles by Pan India Type Of Plan · filters above apply · "
+        f"as of End date {end_lbl or '—'}"
+        + (f" (range {start_lbl} → {end_lbl})" if start_lbl and end_lbl else "")
+    )
+
+    summary = _type_of_plan_summary(view)
+    chart_rows = summary[summary["Type Of Plan"] != "Total"].copy()
+    if chart_rows.empty:
+        st.info("No Type Of Plan data for current filters.")
+        return
+
+    c1, c2 = st.columns([1.45, 1])
+    with c1:
+        fig = px.bar(
+            chart_rows,
+            x="Type Of Plan",
+            y="Vehicles",
+            text="Vehicles",
+            color="Type Of Plan",
+            color_discrete_sequence=[
+                "#0F6E56",
+                "#1F6B8A",
+                "#C45C26",
+                "#5B6B7A",
+                "#8B5E3C",
+                "#3D5A4C",
+            ],
+            labels={"Vehicles": "Vehicles", "Type Of Plan": ""},
+        )
+        fig.update_traces(
+            texttemplate="%{text}",
+            textposition="outside",
+            cliponaxis=False,
+            showlegend=False,
+        )
+        y_max = float(chart_rows["Vehicles"].max()) if len(chart_rows) else 0
+        fig.update_layout(
+            autosize=True,
+            height=320,
+            margin=dict(l=4, r=8, t=28, b=8),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            showlegend=False,
+            yaxis=dict(
+                gridcolor="#DCE6E1",
+                title="Vehicles",
+                range=[0, y_max * 1.22 + 2],
+            ),
+            xaxis=dict(title=""),
+            font=dict(family="DM Sans", color="#0B1F18"),
+            bargap=0.35,
+        )
+        _show_plotly(fig)
+
+    with c2:
+        display = chart_rows.copy()
+        # show Total row too
+        display = summary.copy()
+        display["Total Revenue"] = (display["Total Revenue"] / 1e5).round(2)
+        st.dataframe(
+            display,
+            use_container_width=True,
+            hide_index=True,
+            height=320,
+            column_config={
+                "Type Of Plan": st.column_config.TextColumn("Type Of Plan"),
+                "Vehicles": st.column_config.NumberColumn(
+                    "Vehicles", format="localized"
+                ),
+                "Partners": st.column_config.NumberColumn(
+                    "Partners", format="localized"
+                ),
+                "Total Revenue": st.column_config.NumberColumn(
+                    "Revenue (₹ Lakh)", format="%.2f"
+                ),
+                "Share %": st.column_config.NumberColumn("Share %", format="%.1f"),
+            },
+        )
+
+
 def _render_filtered_views(
     table: pd.DataFrame,
     partner: str,
@@ -1093,6 +1240,8 @@ def _render_filtered_views(
             ["Total Revenue", "Partner Name", "Vehicle Number"],
             ascending=[False, True, True],
         ).reset_index(drop=True)
+
+    _render_type_of_plan_mix(view)
 
     st.subheader("Detail")
     st.caption(
