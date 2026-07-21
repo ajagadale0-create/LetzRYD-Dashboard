@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v40-soft-partner-import", source_fingerprint(uber_root())]
+    parts = ["v41-real-waterfall-chart", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1407,50 +1407,71 @@ def _render_partner_page(fp: str) -> None:
         else:
             wf1, wf2 = st.columns([1.6, 1])
             with wf1:
-                measures = churn_steps["Measure"].tolist()
-                values = [float(v) for v in churn_steps["Value"].tolist()]
-                texts = []
-                for m, v in zip(measures, values):
-                    if m == "relative" and v < 0:
-                        texts.append(str(int(v)))
-                    elif m == "relative":
-                        texts.append(f"+{int(v)}")
-                    else:
-                        texts.append(str(int(v)))
+                # Classic waterfall: Opening → +New → -Churn → Closing
+                # (do not put ISO dates in x — Plotly treats them as a time axis)
+                x_labels = ["Opening", "+ New", "- Churn", "Closing"]
+                measures = ["absolute", "relative", "relative", "total"]
+                opening_v = float(churn_meta.get("opening") or 0)
+                new_v = float(churn_meta.get("new") or 0)
+                churn_v = float(churn_meta.get("churn") or 0)
+                closing_v = float(churn_meta.get("closing") or 0)
+                values = [opening_v, new_v, -churn_v, closing_v]
+                texts = [
+                    str(int(opening_v)),
+                    f"+{int(new_v)}",
+                    f"-{int(churn_v)}",
+                    str(int(closing_v)),
+                ]
+                custom = [
+                    f"As of {churn_meta.get('opening_date', '')}",
+                    "Joined / returned vs opening",
+                    "Dropped off vs opening",
+                    f"As of {churn_meta.get('closing_date', '')}",
+                ]
                 fig_wf = go.Figure(
                     go.Waterfall(
                         name="Partners",
                         orientation="v",
                         measure=measures,
-                        x=churn_steps["Step"].tolist(),
+                        x=x_labels,
                         y=values,
                         text=texts,
                         textposition="outside",
-                        connector={"line": {"color": "#9BB0A8", "width": 1}},
+                        customdata=custom,
+                        connector={
+                            "line": {"color": "#9BB0A8", "width": 1},
+                            "mode": "between",
+                        },
                         increasing={"marker": {"color": "#0F6E56"}},
                         decreasing={"marker": {"color": "#C45C26"}},
                         totals={"marker": {"color": "#1F3A34"}},
-                        hovertemplate="%{x}<br>%{text}<extra></extra>",
+                        hovertemplate=(
+                            "<b>%{x}</b><br>%{text} partners"
+                            "<br>%{customdata}<extra></extra>"
+                        ),
                     )
                 )
-                opening_v = float(churn_meta.get("opening") or 0)
-                closing_v = float(churn_meta.get("closing") or 0)
-                y_max = max(
-                    [opening_v, closing_v] + [abs(v) for v in values] + [0]
-                )
+                bridge_peak = opening_v + new_v
+                y_max = max(opening_v, closing_v, bridge_peak, 1)
                 fig_wf.update_layout(
                     autosize=True,
-                    height=340,
-                    margin=dict(l=4, r=8, t=28, b=8),
+                    height=360,
+                    margin=dict(l=4, r=8, t=36, b=8),
                     paper_bgcolor="rgba(0,0,0,0)",
                     plot_bgcolor="rgba(0,0,0,0)",
                     showlegend=False,
                     yaxis=dict(
                         gridcolor="#DCE6E1",
                         title="Active Partner IDs",
-                        range=[0, y_max * 1.18 + 2],
+                        range=[0, y_max * 1.22 + 2],
+                        zeroline=False,
                     ),
-                    xaxis=dict(title=""),
+                    xaxis=dict(
+                        title="",
+                        type="category",
+                        categoryorder="array",
+                        categoryarray=x_labels,
+                    ),
                     font=dict(family="DM Sans", color="#0B1F18"),
                 )
                 _show_plotly(fig_wf)
