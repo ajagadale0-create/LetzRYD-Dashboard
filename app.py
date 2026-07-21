@@ -279,7 +279,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v43-type-of-plan-mix-dashboard", source_fingerprint(uber_root())]
+    parts = ["v44-type-of-plan-mix-today-only", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -747,6 +747,19 @@ def _current_month_range(available_dates: list[str]) -> tuple[str, str] | None:
     return in_month[0], in_month[-1]
 
 
+def _resolve_today_date(available_dates: list[str]) -> tuple[str, bool]:
+    """Calendar today if present in data; else latest available day.
+
+    Returns (date_str, is_exact_today).
+    """
+    today = pd.Timestamp.today().normalize().strftime("%Y-%m-%d")
+    if available_dates and today in available_dates:
+        return today, True
+    if available_dates:
+        return str(available_dates[-1]), False
+    return today, False
+
+
 def _render_km_mix_pie(df: pd.DataFrame, *, period_label: str) -> None:
     """Pie on left · full labels on right (Unproductive always listed)."""
     st.subheader("KM mix")
@@ -947,17 +960,43 @@ def _type_of_plan_summary(view: pd.DataFrame) -> pd.DataFrame:
     return pd.concat([out, total_row], ignore_index=True)
 
 
-def _render_type_of_plan_mix(view: pd.DataFrame) -> None:
-    """Dashboard: Type Of Plan wise mix for current filtered fleet table."""
+def _render_type_of_plan_mix(
+    fp: str,
+    available_dates: list[str],
+    partner: str,
+    type_pick: str,
+    city: str,
+) -> None:
+    """Dashboard: Type Of Plan mix for today only (not Start→End range)."""
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
-    end_lbl = str(st.session_state.get("day_end") or "")
-    start_lbl = str(st.session_state.get("day_start") or "")
+    day, is_today = _resolve_today_date(available_dates)
     st.subheader("Type Of Plan mix")
-    st.caption(
-        "Vehicles by Pan India Type Of Plan · filters above apply · "
-        f"as of End date {end_lbl or '—'}"
-        + (f" (range {start_lbl} → {end_lbl})" if start_lbl and end_lbl else "")
-    )
+    if is_today:
+        st.caption(
+            f"Today only ({day}) · City / Partner / Type filters apply · "
+            "not the Start→End range"
+        )
+    else:
+        st.caption(
+            f"Latest available day ({day}) — today not in data yet · "
+            "City / Partner / Type filters apply · not the Start→End range"
+        )
+
+    view = pd.DataFrame()
+    try:
+        day_table, _ = load_range_table(day, day, fp)
+        view = day_table
+        if city != "All cities":
+            view = view[view["City"].fillna("").astype(str).str.strip() == city]
+        if partner != "All partners":
+            view = view[
+                view["Partner Name"].fillna("").astype(str).str.strip() == partner
+            ]
+        if type_pick != "All types":
+            view = view[view["Type"].fillna("").astype(str).str.strip() == type_pick]
+    except Exception as exc:
+        st.warning(f"Could not load today's Type Of Plan mix: {exc}")
+        return
 
     summary = _type_of_plan_summary(view)
     chart_rows = summary[summary["Type Of Plan"] != "Total"].copy()
@@ -1039,6 +1078,9 @@ def _render_filtered_views(
     partner: str,
     type_pick: str,
     city: str,
+    *,
+    fp: str = "",
+    available_dates: list[str] | None = None,
 ) -> None:
     summary_base = table
     if city != "All cities":
@@ -1241,7 +1283,13 @@ def _render_filtered_views(
             ascending=[False, True, True],
         ).reset_index(drop=True)
 
-    _render_type_of_plan_mix(view)
+    _render_type_of_plan_mix(
+        fp,
+        available_dates or [],
+        partner,
+        type_pick,
+        city,
+    )
 
     st.subheader("Detail")
     st.caption(
@@ -1998,7 +2046,14 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
             st.info("No available dates in the current calendar month.")
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
-    _render_filtered_views(table, partner, type_pick, city)
+    _render_filtered_views(
+        table,
+        partner,
+        type_pick,
+        city,
+        fp=fp,
+        available_dates=available_dates,
+    )
 
 
 def main():
