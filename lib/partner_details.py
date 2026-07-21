@@ -505,6 +505,171 @@ def build_operator_vehicle_table(
     return out.reset_index(drop=True)
 
 
+def _active_ids_on_date(
+    alloc_df: pd.DataFrame,
+    on_date: pd.Timestamp,
+    *,
+    city: str | None = None,
+    allowed_ids: set[str] | None = None,
+) -> set[str]:
+    if alloc_df is None or alloc_df.empty or "Date" not in alloc_df.columns:
+        return set()
+    target = pd.Timestamp(on_date).normalize()
+    day = alloc_df[pd.to_datetime(alloc_df["Date"], errors="coerce") == target].copy()
+    if day.empty:
+        return set()
+    if city and city not in {"All cities", "All Cities", ""} and "City" in day.columns:
+        day = day[day["City"].fillna("").astype(str).str.strip() == city]
+    if day.empty or "partner IDs" not in day.columns:
+        return set()
+    ids = {
+        _norm_partner_id(v)
+        for v in day["partner IDs"].fillna("").tolist()
+        if _norm_partner_id(v) and _norm_partner_id(v) != "RFD"
+    }
+    if allowed_ids is not None:
+        ids &= allowed_ids
+    return ids
+
+
+def build_monthly_partner_churn(
+    alloc_df: pd.DataFrame,
+    partner_df: pd.DataFrame | None = None,
+    *,
+    as_of: str | pd.Timestamp | None = None,
+    city: str | None = None,
+    onboarding_type: str | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """
+    Current-month active-partner movement from Vehicle Allocation Status.
+
+    Opening = last allocation day before month (else first day in month)
+    Closing = latest allocation day in month (up to as_of)
+    New = in closing, not in opening
+    Churn = in opening, not in closing
+    """
+    empty = pd.DataFrame(
+        columns=["Step", "Measure", "Value", "Label"]
+    )
+    meta: dict = {
+        "month": "",
+        "opening_date": "",
+        "closing_date": "",
+        "opening": 0,
+        "new": 0,
+        "churn": 0,
+        "closing": 0,
+        "net": 0,
+        "message": "",
+    }
+    if alloc_df is None or alloc_df.empty or "Date" not in alloc_df.columns:
+        meta["message"] = "No allocation data for churn waterfall"
+        return empty, meta
+
+    asof = (
+        pd.Timestamp(as_of).normalize()
+        if as_of is not None
+        else pd.Timestamp.today().normalize()
+    )
+    month_start = asof.replace(day=1)
+    meta["month"] = month_start.strftime("%b %Y")
+
+    work = alloc_df.copy()
+    work["_d"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+    work = work[work["_d"].notna()].copy()
+    if work.empty:
+        meta["message"] = "No valid allocation dates"
+        return empty, meta
+
+    allowed_ids: set[str] | None = None
+    if partner_df is not None and not partner_df.empty and onboarding_type:
+        if onboarding_type not in {"All onboarding types", ""}:
+            pdf = partner_df.copy()
+            if "Onboarding Type" in pdf.columns:
+                pdf["_ot"] = pdf["Onboarding Type"].map(_normalize_onboarding_type)
+                allowed_ids = {
+                    _norm_partner_id(v)
+                    for v, ot in zip(pdf["Partner ID"], pdf["_ot"])
+                    if ot == onboarding_type and _norm_partner_id(v)
+                }
+
+    all_dates = sorted(work["_d"].unique())
+    prior = [d for d in all_dates if d < month_start]
+    in_month = [d for d in all_dates if month_start <= d <= asof]
+    if not in_month and not prior:
+        meta["message"] = f"No allocation rows for {meta['month']}"
+        return empty, meta
+
+    opening_date = prior[-1] if prior else (in_month[0] if in_month else None)
+    closing_date = in_month[-1] if in_month else opening_date
+    if opening_date is None or closing_date is None:
+        meta["message"] = f"No allocation rows for {meta['month']}"
+        return empty, meta
+
+    opening_ids = _active_ids_on_date(
+        work, opening_date, city=city, allowed_ids=allowed_ids
+    )
+    closing_ids = _active_ids_on_date(
+        work, closing_date, city=city, allowed_ids=allowed_ids
+    )
+    new_ids = closing_ids - opening_ids
+    churn_ids = opening_ids - closing_ids
+
+    opening_n = len(opening_ids)
+    new_n = len(new_ids)
+    churn_n = len(churn_ids)
+    closing_n = len(closing_ids)
+    net = new_n - churn_n
+
+    meta.update(
+        {
+            "opening_date": pd.Timestamp(opening_date).strftime("%Y-%m-%d"),
+            "closing_date": pd.Timestamp(closing_date).strftime("%Y-%m-%d"),
+            "opening": opening_n,
+            "new": new_n,
+            "churn": churn_n,
+            "closing": closing_n,
+            "net": net,
+            "new_ids": sorted(new_ids),
+            "churn_ids": sorted(churn_ids),
+            "message": (
+                f"{meta['month']}: open {opening_n} -> +{new_n} new -{churn_n} churn "
+                f"= {closing_n} (net {net:+d})"
+            ),
+        }
+    )
+
+    steps = pd.DataFrame(
+        [
+            {
+                "Step": f"Opening\n{meta['opening_date']}",
+                "Measure": "absolute",
+                "Value": opening_n,
+                "Label": "Opening active",
+            },
+            {
+                "Step": "New additions",
+                "Measure": "relative",
+                "Value": new_n,
+                "Label": "Joined / returned",
+            },
+            {
+                "Step": "Churn",
+                "Measure": "relative",
+                "Value": -churn_n,
+                "Label": "Dropped off",
+            },
+            {
+                "Step": f"Closing\n{meta['closing_date']}",
+                "Measure": "absolute",
+                "Value": closing_n,
+                "Label": "Closing active",
+            },
+        ]
+    )
+    return steps, meta
+
+
 def build_partner_status_table(
     partner_df: pd.DataFrame,
     alloc_df: pd.DataFrame,
