@@ -20,11 +20,15 @@ from lib.uber_process import (
 )
 from lib.uber_allocation import (
     assemble_fleet_table,
-    assemble_fleet_daily_table,
     run_on_daily_counts,
     ageing_daily_counts,
     revenue_deadmile_daily,
 )
+
+try:
+    from lib.uber_allocation import assemble_fleet_daily_table
+except ImportError:  # older deploy / partial Cloud sync
+    assemble_fleet_daily_table = None  # type: ignore[misc, assignment]
 from lib.allocation import (
     allocation_dir,
     list_allocation_files,
@@ -270,7 +274,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v54-detail-daily-rows", source_fingerprint(uber_root())]
+    parts = ["v55-soft-import-daily-detail", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -447,6 +451,19 @@ def load_daily_detail_table(start_date: str, end_date: str, fingerprint: str):
     ola_days, _ = cached_ola_days(fingerprint)
     gps_days, _ = cached_gps_days(fingerprint)
     rapido_days, _ = cached_rapido_days(fingerprint)
+    if assemble_fleet_daily_table is None:
+        # Fallback until Cloud has the new uber_allocation.py
+        return assemble_fleet_table(
+            start_date,
+            end_date,
+            alloc,
+            alloc_meta,
+            uber_days,
+            ola_days,
+            gps_days,
+            rapido_days,
+            write_output=False,
+        )
     return assemble_fleet_daily_table(
         start_date,
         end_date,
