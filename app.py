@@ -57,8 +57,6 @@ try:
     from lib.partner_details import (
         AGE_BUCKETS,
         build_ageing_basket_summary,
-        build_operator_vehicle_summary,
-        build_operator_vehicle_table,
         build_partner_status_table,
         list_partner_detail_files,
         load_partner_details,
@@ -103,14 +101,6 @@ except Exception as _partner_exc:  # noqa: BLE001 — keep app alive on Cloud mi
         return __import__("pandas").DataFrame(
             columns=["Ageing", "Active", "Inactive", "Total", "Active %"]
         )
-
-    def build_operator_vehicle_summary(alloc_df, partner_view):
-        return __import__("pandas").DataFrame(
-            columns=["Vehicles", "Operators", "Active", "Inactive"]
-        )
-
-    def build_operator_vehicle_table(alloc_df, partner_view):
-        return __import__("pandas").DataFrame()
 
 
 st.set_page_config(
@@ -279,7 +269,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v51-type-of-plan-rfd-canon", source_fingerprint(uber_root())]
+    parts = ["v53-driver-movement-beside-ageing", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -1692,37 +1682,46 @@ def _render_partner_page(fp: str) -> None:
     )
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
-    # Partner page only — current-month churn / new-addition waterfall
-    try:
-        from lib.partner_details import build_monthly_partner_churn
-        import plotly.graph_objects as go
+    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
-        churn_steps, churn_meta = build_monthly_partner_churn(
-            alloc_df,
-            partner_df,
-            city=None if city_pick == "All cities" else city_pick,
-            onboarding_type=None
-            if type_pick == "All onboarding types"
-            else type_pick,
-        )
-        st.subheader(
-            f"Driver movement · {churn_meta.get('month') or 'current month'}"
-        )
-        st.caption(
-            "Unique onboarding Partner IDs only (same as Ageing Active) · "
-            "Opening = last day before month · Closing = latest day this month · "
-            "+New / −Churn between those two days"
-        )
-        if churn_steps.empty:
-            st.info(
-                churn_meta.get("message")
-                or "Not enough allocation days for waterfall."
+    # Partner page: Driver movement (waterfall) | Ageing basket (chart)
+    age_summary = build_ageing_basket_summary(view)
+    chart_rows = age_summary[age_summary["Ageing"] != "Total"].copy()
+    chart_long = chart_rows.melt(
+        id_vars="Ageing",
+        value_vars=["Active", "Inactive"],
+        var_name="Partner Status",
+        value_name="Partners",
+    )
+    chart_long = chart_long[chart_long["Partners"] > 0]
+
+    move_col, age_col = st.columns(2)
+
+    with move_col:
+        try:
+            from lib.partner_details import build_monthly_partner_churn
+            import plotly.graph_objects as go
+
+            churn_steps, churn_meta = build_monthly_partner_churn(
+                alloc_df,
+                partner_df,
+                city=None if city_pick == "All cities" else city_pick,
+                onboarding_type=None
+                if type_pick == "All onboarding types"
+                else type_pick,
             )
-        else:
-            wf1, wf2 = st.columns([1.6, 1])
-            with wf1:
-                # Classic waterfall: Opening → +New → -Churn → Closing
-                # (do not put ISO dates in x — Plotly treats them as a time axis)
+            month_lbl = churn_meta.get("month") or "current month"
+            st.subheader(f"Driver movement · {month_lbl}")
+            st.caption(
+                "Unique onboarding Partner IDs · "
+                "Opening → +New → −Churn → Closing"
+            )
+            if churn_steps.empty:
+                st.info(
+                    churn_meta.get("message")
+                    or "Not enough allocation days for waterfall."
+                )
+            else:
                 x_labels = ["Opening", "+ New", "- Churn", "Closing"]
                 measures = ["absolute", "relative", "relative", "total"]
                 opening_v = float(churn_meta.get("opening") or 0)
@@ -1789,73 +1788,17 @@ def _render_partner_page(fp: str) -> None:
                     font=dict(family="DM Sans", color="#0B1F18"),
                 )
                 _show_plotly(fig_wf)
-            with wf2:
-                st.caption("Month bridge")
-                st.dataframe(
-                    pd.DataFrame(
-                        [
-                            {
-                                "Metric": "Opening active",
-                                "Date": churn_meta.get("opening_date", ""),
-                                "Partners": churn_meta.get("opening", 0),
-                            },
-                            {
-                                "Metric": "New additions",
-                                "Date": "",
-                                "Partners": churn_meta.get("new", 0),
-                            },
-                            {
-                                "Metric": "Churn",
-                                "Date": "",
-                                "Partners": churn_meta.get("churn", 0),
-                            },
-                            {
-                                "Metric": "Closing active",
-                                "Date": churn_meta.get("closing_date", ""),
-                                "Partners": churn_meta.get("closing", 0),
-                            },
-                            {
-                                "Metric": "Net change",
-                                "Date": "",
-                                "Partners": churn_meta.get("net", 0),
-                            },
-                        ]
-                    ),
-                    use_container_width=True,
-                    hide_index=True,
-                    height=280,
-                    column_config={
-                        "Metric": st.column_config.TextColumn("Metric"),
-                        "Date": st.column_config.TextColumn("Date"),
-                        "Partners": st.column_config.NumberColumn(
-                            "Partners", format="localized"
-                        ),
-                    },
-                )
-                st.caption(str(churn_meta.get("message", "")))
-    except Exception as exc:
-        st.warning(f"Driver movement chart unavailable: {exc}")
+                if churn_meta.get("message"):
+                    st.caption(str(churn_meta.get("message")))
+        except Exception as exc:
+            st.warning(f"Driver movement chart unavailable: {exc}")
 
-    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
-
-    age_summary = build_ageing_basket_summary(view)
-    chart_rows = age_summary[age_summary["Ageing"] != "Total"].copy()
-    chart_long = chart_rows.melt(
-        id_vars="Ageing",
-        value_vars=["Active", "Inactive"],
-        var_name="Partner Status",
-        value_name="Partners",
-    )
-    chart_long = chart_long[chart_long["Partners"] > 0]
-
-    left, right = st.columns([1.35, 1])
-    with left:
+    with age_col:
         st.subheader("Ageing basket")
         st.caption(
-            "Driver age buckets · Active vs Inactive partner IDs · "
+            "Driver age buckets · Active vs Inactive · "
             f"DOB parsed={status_meta.get('dob_parsed', 0)} · "
-            f"Unknown={status_meta.get('dob_unknown', 0)} "
-            "(blank / 1900 / unreadable DOB)"
+            f"Unknown={status_meta.get('dob_unknown', 0)}"
         )
         if not chart_long.empty:
             fig = px.bar(
@@ -1893,7 +1836,7 @@ def _render_partner_page(fp: str) -> None:
             y_max = float(chart_rows["Total"].max()) if len(chart_rows) else 0
             fig.update_layout(
                 autosize=True,
-                height=340,
+                height=360,
                 margin=dict(l=4, r=8, t=44, b=8),
                 paper_bgcolor="rgba(0,0,0,0)",
                 plot_bgcolor="rgba(0,0,0,0)",
@@ -1910,57 +1853,19 @@ def _render_partner_page(fp: str) -> None:
         else:
             st.info("No partner rows available for ageing chart.")
 
-    with right:
-        st.subheader("Ageing table")
-        st.caption("Basket-wise Active / Inactive / Total")
-        st.dataframe(
-            age_summary,
-            use_container_width=True,
-            hide_index=True,
-            height=340,
-            column_config={
-                "Ageing": st.column_config.TextColumn("Ageing", alignment="center"),
-                "Active": st.column_config.NumberColumn("Active", format="localized"),
-                "Inactive": st.column_config.NumberColumn("Inactive", format="localized"),
-                "Total": st.column_config.NumberColumn("Total", format="localized"),
-                "Active %": st.column_config.NumberColumn("Active %", format="%.1f"),
-            },
-        )
-
-    operator_summary = build_operator_vehicle_summary(alloc_df, view)
-    operator_table = build_operator_vehicle_table(alloc_df, view)
-
-    st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
-    st.subheader("Operator · vehicle count")
-    st.caption("Latest allocation date · vehicles per Operator partner ID")
+    st.subheader("Ageing table")
+    st.caption("Basket-wise Active / Inactive / Total")
     st.dataframe(
-        operator_summary,
+        age_summary,
         use_container_width=True,
         hide_index=True,
-        height=220,
+        height=280,
         column_config={
-            "Vehicles": st.column_config.TextColumn("Vehicles", alignment="center"),
-            "Operators": st.column_config.NumberColumn("Operators", format="localized"),
+            "Ageing": st.column_config.TextColumn("Ageing", alignment="center"),
             "Active": st.column_config.NumberColumn("Active", format="localized"),
             "Inactive": st.column_config.NumberColumn("Inactive", format="localized"),
-        },
-    )
-
-    st.dataframe(
-        operator_table,
-        use_container_width=True,
-        hide_index=True,
-        height=420,
-        column_config={
-            "Partner ID": st.column_config.TextColumn("Partner ID"),
-            "Driver Name": st.column_config.TextColumn("Driver Name"),
-            "City": st.column_config.TextColumn("City"),
-            "Vehicle Count": st.column_config.NumberColumn(
-                "Vehicle Count", format="localized"
-            ),
-            "Partner Status": st.column_config.TextColumn("Status"),
-            "Ageing": st.column_config.TextColumn("Ageing", alignment="center"),
-            "Driver Age": st.column_config.NumberColumn("Age", format="%d"),
+            "Total": st.column_config.NumberColumn("Total", format="localized"),
+            "Active %": st.column_config.NumberColumn("Active %", format="%.1f"),
         },
     )
 

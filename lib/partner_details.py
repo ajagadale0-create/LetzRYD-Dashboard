@@ -572,7 +572,7 @@ def build_monthly_partner_churn(
         else pd.Timestamp.today().normalize()
     )
     month_start = asof.replace(day=1)
-    meta["month"] = month_start.strftime("%b %Y")
+        meta["month"] = month_start.strftime("%B %Y")
 
     work = alloc_df.copy()
     work["_d"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
