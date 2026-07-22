@@ -818,6 +818,292 @@ def assemble_fleet_table(
     return joined, meta
 
 
+def _prep_day_metrics(
+    days: pd.DataFrame | None, value_cols: list[str]
+) -> pd.DataFrame:
+    """Normalize vehicle-day metric frame for merge on Vehicle Number + Date."""
+    cols = ["Vehicle Number", "Date", *value_cols]
+    if days is None or days.empty:
+        return pd.DataFrame(columns=cols)
+    work = days.copy()
+    if "Vehicle Number" not in work.columns or "Date" not in work.columns:
+        return pd.DataFrame(columns=cols)
+    work["Vehicle Number"] = work["Vehicle Number"].map(_norm_vehicle)
+    work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+    work = work[work["Vehicle Number"].ne("") & work["Date"].notna()].copy()
+    for col in value_cols:
+        if col not in work.columns:
+            work[col] = 0
+        work[col] = pd.to_numeric(work[col], errors="coerce").fillna(0)
+    return (
+        work.groupby(["Vehicle Number", "Date"], as_index=False)[value_cols]
+        .sum()
+    )
+
+
+def assemble_fleet_daily_table(
+    start_date: str,
+    end_date: str,
+    alloc: pd.DataFrame,
+    alloc_meta: dict,
+    uber_days: pd.DataFrame,
+    ola_days: pd.DataFrame,
+    gps_days: pd.DataFrame | None = None,
+    rapido_days: pd.DataFrame | None = None,
+) -> tuple[pd.DataFrame, dict]:
+    """One row per Vehicle × Date for Start→End (Detail / CSV download).
+
+    Metrics are that day's Uber/Ola/Rapido/GPS — not range totals.
+    """
+    start = pd.Timestamp(start_date).normalize()
+    end = pd.Timestamp(end_date).normalize()
+    if end < start:
+        start, end = end, start
+        start_date, end_date = end_date, start_date
+
+    empty_meta = {
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+        "grain": "daily",
+        "allocation": alloc_meta,
+        "allocation_rows_on_date": 0,
+        "vehicles": 0,
+        "rows": 0,
+    }
+
+    if alloc is None or alloc.empty:
+        return _empty_table(), empty_meta
+
+    in_range = alloc[(alloc["Date"] >= start) & (alloc["Date"] <= end)].copy()
+    if in_range.empty:
+        return _empty_table(), empty_meta
+
+    in_range = in_range.sort_values(["Vehicle Number", "Date"])
+    in_range["Vehicle Number"] = in_range["Vehicle Number"].map(_norm_vehicle)
+    # One allocation snapshot per vehicle per day
+    lookup = in_range.drop_duplicates(["Vehicle Number", "Date"], keep="last").copy()
+    lookup = lookup.rename(
+        columns={
+            "partner IDs": "Partner ID",
+            "partner Name": "Partner Name",
+        }
+    )
+
+    for col in ("Partner ID", "Partner Name", "DM Name", "Type", "City"):
+        if col not in lookup.columns:
+            lookup[col] = ""
+        lookup[col] = (
+            lookup[col]
+            .fillna("")
+            .astype(str)
+            .str.strip()
+            .replace({"nan": "", "None": "", "NaT": ""})
+        )
+        lookup[col] = lookup[col].where(
+            ~lookup[col].str.lower().isin(["nan", "none", "nat"]), ""
+        )
+    lookup["Partner ID"] = lookup["Partner ID"].map(_norm_partner_id)
+    lookup = lookup[lookup["Vehicle Number"].ne("")].copy()
+
+    id_by_name: dict[str, str] = {}
+    name_by_id: dict[str, str] = {}
+    for _, r in in_range.iterrows():
+        pid = _norm_partner_id(r.get("partner IDs", ""))
+        pname = str(r.get("partner Name", "") or "").strip()
+        if pid and pname and pname.lower() not in {"nan", "none"}:
+            id_by_name.setdefault(pname.upper(), pid)
+            name_by_id.setdefault(pid.upper(), pname)
+    blank_id = lookup["Partner ID"].eq("") & lookup["Partner Name"].ne("")
+    lookup.loc[blank_id, "Partner ID"] = lookup.loc[blank_id, "Partner Name"].map(
+        lambda n: id_by_name.get(str(n).upper(), "")
+    )
+    blank_name = lookup["Partner Name"].eq("") & lookup["Partner ID"].ne("")
+    lookup.loc[blank_name, "Partner Name"] = lookup.loc[blank_name, "Partner ID"].map(
+        lambda i: name_by_id.get(str(i).upper(), "")
+    )
+
+    if "Allocation Date" in lookup.columns:
+        lookup["Latest Allocation Date"] = pd.to_datetime(
+            lookup["Allocation Date"], errors="coerce"
+        ).dt.strftime("%Y-%m-%d")
+    else:
+        lookup["Latest Allocation Date"] = ""
+    lookup["Latest Allocation Date"] = (
+        lookup["Latest Allocation Date"].replace({"NaT": ""}).fillna("")
+    )
+
+    if "Drop Off Date" in lookup.columns:
+        row_drop = pd.to_datetime(lookup["Drop Off Date"], errors="coerce")
+    else:
+        row_drop = pd.Series(pd.NaT, index=lookup.index)
+    lookup["Drop Off Date"] = ""
+    no_partner = lookup["Partner ID"].eq("")
+    lookup.loc[no_partner, "Drop Off Date"] = (
+        row_drop.loc[no_partner].dt.strftime("%Y-%m-%d").replace({"NaT": ""}).fillna("")
+    )
+
+    lookup["_day"] = pd.to_datetime(lookup["Date"], errors="coerce").dt.normalize()
+    lookup = lookup[lookup["_day"].notna()].copy()
+
+    uber_m = _prep_day_metrics(
+        uber_days,
+        ["Revenue", "Cash Collection", "Trip Completed Count", "Trip Distance"],
+    ).rename(columns={"Date": "_day"})
+    ola_m = _prep_day_metrics(
+        ola_days,
+        [
+            "Ola Customer Bill",
+            "Ola Cash Collected",
+            "Ola Actual Kms",
+            "Ola Trip Time",
+            "Ola Trips",
+        ],
+    ).rename(columns={"Date": "_day"})
+    gps_m = _prep_day_metrics(
+        gps_days if gps_days is not None else pd.DataFrame(),
+        ["GPS KMs"],
+    ).rename(columns={"Date": "_day"})
+    rapido_m = _prep_day_metrics(
+        rapido_days if rapido_days is not None else pd.DataFrame(),
+        ["Rapido Revenue", "Rapido Ride Time", "Rapido Trips"],
+    ).rename(columns={"Date": "_day"})
+
+    joined = lookup.merge(uber_m, on=["Vehicle Number", "_day"], how="left")
+    joined = joined.merge(ola_m, on=["Vehicle Number", "_day"], how="left")
+    joined = joined.merge(gps_m, on=["Vehicle Number", "_day"], how="left")
+    joined = joined.merge(rapido_m, on=["Vehicle Number", "_day"], how="left")
+
+    for col in (
+        "Revenue",
+        "Cash Collection",
+        "Trip Completed Count",
+        "Trip Distance",
+        "Ola Customer Bill",
+        "Ola Cash Collected",
+        "Ola Actual Kms",
+        "Ola Trip Time",
+        "Ola Trips",
+        "GPS KMs",
+        "Rapido Revenue",
+        "Rapido Ride Time",
+        "Rapido Trips",
+    ):
+        if col not in joined.columns:
+            joined[col] = 0
+        joined[col] = joined[col].fillna(0)
+
+    for col in (
+        "Partner ID",
+        "Partner Name",
+        "Latest Allocation Date",
+        "Drop Off Date",
+        "Type",
+        "DM Name",
+        "City",
+    ):
+        if col not in joined.columns:
+            joined[col] = ""
+        joined[col] = joined[col].fillna("")
+
+    joined["Trip Completed Count"] = joined["Trip Completed Count"].astype(int)
+    joined["Ola Trips"] = joined["Ola Trips"].astype(int)
+    joined["Rapido Trips"] = joined["Rapido Trips"].astype(int)
+    joined["Ola Trip Time"] = joined["Ola Trip Time"].round(0).astype(int)
+    for col in (
+        "Revenue",
+        "Cash Collection",
+        "Trip Distance",
+        "Ola Customer Bill",
+        "Ola Cash Collected",
+        "Ola Actual Kms",
+        "GPS KMs",
+        "Rapido Revenue",
+        "Rapido Ride Time",
+    ):
+        joined[col] = joined[col].round(2)
+
+    joined["Total Revenue"] = (
+        joined["Revenue"] + joined["Ola Customer Bill"] + joined["Rapido Revenue"]
+    ).round(2)
+    joined["Total Cash Collection"] = (
+        joined["Cash Collection"] + joined["Ola Cash Collected"]
+    ).round(2)
+    joined["Total Trip"] = (
+        joined["Trip Completed Count"] + joined["Ola Trips"] + joined["Rapido Trips"]
+    ).astype(int)
+    joined["Total Intrip KM"] = (
+        joined["Trip Distance"] + joined["Ola Actual Kms"]
+    ).round(2)
+    # Per-day Ideal KM (1 day buffer)
+    joined["Ideal KM"] = (
+        30 + (3 * joined["Total Trip"]) + joined["Total Intrip KM"]
+    ).round(2)
+    joined["Approved KM"] = (
+        joined[["GPS KMs", "Ideal KM"]].min(axis=1) - joined["Total Intrip KM"]
+    ).round(2)
+    joined["Buffer KM"] = (joined["GPS KMs"] - joined["Ideal KM"]).round(2)
+    joined["Deadmile Charges"] = (joined["Buffer KM"].clip(lower=0) * 3).round(2)
+    joined["Dead KM"] = (joined["GPS KMs"] - joined["Ideal KM"]).clip(lower=0).round(2)
+    has_real_id = joined["Partner ID"].map(_is_real_partner_id)
+    joined["Dead KM Type"] = "Deadmile"
+    joined.loc[~has_real_id, "Dead KM Type"] = "Unproductive"
+
+    uber_on = (joined["Trip Completed Count"] > 0) | (joined["Revenue"] != 0)
+    ola_on = (joined["Ola Trips"] > 0) | (joined["Ola Customer Bill"] != 0)
+    rapido_on = (joined["Rapido Trips"] > 0) | (joined["Rapido Revenue"] != 0)
+
+    def _run_on_label(u: bool, o: bool, r: bool) -> str:
+        n = int(u) + int(o) + int(r)
+        if n >= 2:
+            return "Mix"
+        if o:
+            return "OLA"
+        if u:
+            return "Uber"
+        if r:
+            return "Rapido"
+        return ""
+
+    joined["Run On"] = [
+        _run_on_label(bool(u), bool(o), bool(r))
+        for u, o, r in zip(uber_on.tolist(), ola_on.tolist(), rapido_on.tolist())
+    ]
+    joined["Ageing"] = _assign_ageing(joined["Partner ID"], joined["Total Revenue"])
+
+    joined["Date"] = joined["_day"].dt.strftime("%Y-%m-%d")
+    plan_meta: dict = {}
+    try:
+        from lib.pan_india_allocation import attach_type_of_plan
+
+        joined, plan_meta = attach_type_of_plan(joined, as_of_date=end)
+    except Exception as exc:
+        joined["Type Of Plan"] = ""
+        plan_meta = {"message": f"Type Of Plan failed: {exc}", "matched": 0, "pan_rows": 0}
+    if "Type Of Plan" not in joined.columns:
+        joined["Type Of Plan"] = ""
+    joined["Type Of Plan"] = joined["Type Of Plan"].fillna("").astype(str)
+    joined["From"] = start.strftime("%Y-%m-%d")
+    joined["To"] = end.strftime("%Y-%m-%d")
+
+    joined = (
+        joined[TABLE_COLS]
+        .sort_values(["Date", "Partner Name", "Vehicle Number"], ascending=True)
+        .reset_index(drop=True)
+    )
+
+    meta = {
+        "start_date": start.strftime("%Y-%m-%d"),
+        "end_date": end.strftime("%Y-%m-%d"),
+        "grain": "daily",
+        "allocation": alloc_meta,
+        "allocation_rows_on_date": len(in_range),
+        "vehicles": int(joined["Vehicle Number"].nunique()) if len(joined) else 0,
+        "rows": len(joined),
+        "type_of_plan": plan_meta,
+    }
+    return joined, meta
+
+
 def build_uber_range_with_allocation(
     start_date: str,
     end_date: str,

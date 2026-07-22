@@ -20,6 +20,7 @@ from lib.uber_process import (
 )
 from lib.uber_allocation import (
     assemble_fleet_table,
+    assemble_fleet_daily_table,
     run_on_daily_counts,
     ageing_daily_counts,
     revenue_deadmile_daily,
@@ -269,7 +270,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v53-driver-movement-beside-ageing", source_fingerprint(uber_root())]
+    parts = ["v54-detail-daily-rows", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -435,6 +436,26 @@ def load_range_table(start_date: str, end_date: str, fingerprint: str):
         gps_days,
         rapido_days,
         write_output=False,
+    )
+
+
+@st.cache_data(show_spinner="Building day-wise Detail…")
+def load_daily_detail_table(start_date: str, end_date: str, fingerprint: str):
+    """One row per vehicle per day for Start→End (Detail + CSV)."""
+    alloc, alloc_meta = cached_allocation(fingerprint)
+    uber_days, _ = cached_uber_days(fingerprint)
+    ola_days, _ = cached_ola_days(fingerprint)
+    gps_days, _ = cached_gps_days(fingerprint)
+    rapido_days, _ = cached_rapido_days(fingerprint)
+    return assemble_fleet_daily_table(
+        start_date,
+        end_date,
+        alloc,
+        alloc_meta,
+        uber_days,
+        ola_days,
+        gps_days,
+        rapido_days,
     )
 
 
@@ -1178,6 +1199,8 @@ def _render_filtered_views(
     *,
     fp: str = "",
     available_dates: list[str] | None = None,
+    start_date: str = "",
+    end_date: str = "",
 ) -> None:
     summary_base = table
     if city != "All cities":
@@ -1366,7 +1389,20 @@ def _render_filtered_views(
             column_config=ageing_cfg,
         )
 
-    view = table
+    # Detail + CSV = one row per vehicle per day in Start→End
+    detail = table
+    if fp and start_date and end_date:
+        try:
+            if start_date == end_date:
+                # Same day: aggregated table already matches that day
+                detail = table
+            else:
+                detail, _ = load_daily_detail_table(start_date, end_date, fp)
+        except Exception as exc:
+            st.warning(f"Day-wise Detail unavailable ({exc}) — showing range totals.")
+            detail = table
+
+    view = detail
     if city != "All cities":
         view = view[view["City"].fillna("").astype(str).str.strip() == city]
     if partner != "All partners":
@@ -1374,11 +1410,10 @@ def _render_filtered_views(
     if type_pick != "All types":
         view = view[view["Type"].fillna("").astype(str).str.strip() == type_pick]
 
-    if "Total Revenue" in view.columns and not view.empty:
-        view = view.sort_values(
-            ["Total Revenue", "Partner Name", "Vehicle Number"],
-            ascending=[False, True, True],
-        ).reset_index(drop=True)
+    if not view.empty:
+        sort_cols = [c for c in ("Date", "Total Revenue", "Partner Name", "Vehicle Number") if c in view.columns]
+        ascending = [True, False, True, True][: len(sort_cols)]
+        view = view.sort_values(sort_cols, ascending=ascending).reset_index(drop=True)
 
     _render_type_of_plan_mix(
         fp,
@@ -1389,14 +1424,23 @@ def _render_filtered_views(
     )
 
     st.subheader("Detail")
-    period = ""
-    if not view.empty and "From" in view.columns and "To" in view.columns:
-        period = f"{view['From'].iloc[0]} → {view['To'].iloc[0]}"
+    n_days = 0
+    if start_date and end_date:
+        try:
+            n_days = int(
+                (pd.Timestamp(end_date).normalize() - pd.Timestamp(start_date).normalize()).days
+            ) + 1
+        except Exception:
+            n_days = 0
     st.caption(
-        (f"Period **{period}** · " if period else "")
-        + "From/To = Start→End filter · "
-        "metrics (Revenue/Trips/KM) summed across that period · "
-        "Date = last allocation day in range (Partner ID / Type Of Plan as-of)"
+        f"**{start_date} → {end_date}** · "
+        + (
+            f"one row per vehicle **per day** ({n_days} day(s)) · "
+            if n_days > 1
+            else "one row per vehicle for this day · "
+        )
+        + "CSV download matches this table · "
+        "metrics = that day's Uber/Ola/Rapido/GPS"
     )
     dl1, dl2 = st.columns([1, 4])
     with dl1:
@@ -1404,7 +1448,11 @@ def _render_filtered_views(
         st.download_button(
             "Download CSV",
             data=csv_bytes,
-            file_name="fleet_detail.csv",
+            file_name=(
+                f"fleet_detail_{start_date}_to_{end_date}.csv"
+                if start_date and end_date
+                else "fleet_detail.csv"
+            ),
             mime="text/csv",
             use_container_width=True,
         )
@@ -2093,6 +2141,8 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
         city,
         fp=fp,
         available_dates=available_dates,
+        start_date=start_date,
+        end_date=end_date,
     )
 
 
