@@ -224,6 +224,42 @@ def run_on_daily_counts(
     return daily.reset_index(drop=True)
 
 
+def _alloc_snapshot_for_day(
+    alloc: pd.DataFrame,
+    day: pd.Timestamp,
+    city: str | None = None,
+) -> pd.DataFrame:
+    """Allocation rows for ``day``; if missing, carry forward last prior day.
+
+    Current Vehicle Allocation Status often lags Uber/OLA by a few days.
+    Without this, Ageing / Revenue charts show blank for those lag days.
+    """
+    if alloc is None or alloc.empty or "Date" not in alloc.columns:
+        return pd.DataFrame()
+
+    day = pd.Timestamp(day).normalize()
+    work = alloc.copy()
+    work["Date"] = pd.to_datetime(work["Date"], errors="coerce").dt.normalize()
+    work = work[work["Date"].notna()].copy()
+    if city and city not in {"All cities", "All Cities", ""}:
+        work = work[work["City"].fillna("").astype(str).str.strip() == city]
+
+    day_alloc = work[work["Date"] == day]
+    if day_alloc.empty:
+        prior = work[work["Date"] < day]
+        if prior.empty:
+            return pd.DataFrame()
+        last = prior["Date"].max()
+        day_alloc = prior[prior["Date"] == last]
+
+    if day_alloc.empty:
+        return pd.DataFrame()
+
+    day_alloc = day_alloc.sort_values(["Vehicle Number", "Date"])
+    day_alloc = day_alloc.drop_duplicates("Vehicle Number", keep="last")
+    return day_alloc.copy()
+
+
 def ageing_daily_counts(
     alloc: pd.DataFrame,
     uber_days: pd.DataFrame,
@@ -240,6 +276,7 @@ def ageing_daily_counts(
     - Only Final Status Active / Allocation / Same Day D&A
     - Real Partner ID only for Not running (excludes RFD / Maintenance as IDs)
     - Window ends at last Uber/Ola activity day (not empty allocation-only days)
+    - If allocation missing for a day, carry forward last prior allocation snapshot
     """
     empty = pd.DataFrame(columns=["Date", "Ageing", "Vehicles"])
     categories = ["< 2500", "> 2500", "Not running"]
@@ -268,19 +305,9 @@ def ageing_daily_counts(
 
     frames: list[pd.DataFrame] = []
     for day in all_days:
-        day_alloc = alloc[alloc["Date"] == day].copy()
+        day_alloc = _alloc_snapshot_for_day(alloc, day, city)
         if day_alloc.empty:
             continue
-        if city and city not in {"All cities", "All Cities", ""}:
-            day_alloc = day_alloc[
-                day_alloc["City"].fillna("").astype(str).str.strip() == city
-            ]
-        if day_alloc.empty:
-            continue
-
-        # Unique vehicle per day (last row if duplicates)
-        day_alloc = day_alloc.sort_values(["Vehicle Number", "Date"])
-        day_alloc = day_alloc.drop_duplicates("Vehicle Number", keep="last")
 
         status = day_alloc.get("Final Status", pd.Series("", index=day_alloc.index))
         status = status.fillna("").astype(str).str.strip()
@@ -389,18 +416,9 @@ def revenue_deadmile_daily(
 
     frames: list[pd.DataFrame] = []
     for day in all_days:
-        day_alloc = alloc[alloc["Date"] == day].copy()
+        day_alloc = _alloc_snapshot_for_day(alloc, day, city)
         if day_alloc.empty:
             continue
-        if city and city not in {"All cities", "All Cities", ""}:
-            day_alloc = day_alloc[
-                day_alloc["City"].fillna("").astype(str).str.strip() == city
-            ]
-        if day_alloc.empty:
-            continue
-
-        day_alloc = day_alloc.sort_values(["Vehicle Number", "Date"])
-        day_alloc = day_alloc.drop_duplicates("Vehicle Number", keep="last")
 
         veh = day_alloc[["Vehicle Number"]].copy()
         if "partner IDs" in day_alloc.columns:

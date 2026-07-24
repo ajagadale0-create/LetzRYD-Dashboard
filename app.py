@@ -274,7 +274,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v55-soft-import-daily-detail", source_fingerprint(uber_root())]
+    parts = ["v56-charts-alloc-carry-forward", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -2092,12 +2092,15 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
 
     st.markdown('<div class="section-rule"></div>', unsafe_allow_html=True)
 
-    # Last 7 days: Uber-aware end (4am→4am). If End is calendar-ahead of Uber,
-    # clamp so the last bar is the latest Uber business day.
-    trend_end = _uber_aware_end(
-        end_date if end_date else (available_dates[-1] if available_dates else ""),
-        uber_max,
+    # Last 7 days: end at latest Uber/activity day so recent days stay on chart
+    # even when Vehicle Allocation Status lags a few days behind.
+    trend_end = end_date if end_date else (
+        available_dates[-1] if available_dates else ""
     )
+    if uber_max and (not trend_end or trend_end < uber_max):
+        trend_end = uber_max
+    else:
+        trend_end = _uber_aware_end(trend_end, uber_max)
 
     try:
         trend = load_run_on_trend(fp, city, trend_end)
@@ -2111,6 +2114,25 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
         rev_trend = load_revenue_deadmile_trend(fp, city, trend_end)
     except Exception:
         rev_trend = pd.DataFrame(columns=["Date", "Metric", "Amount"])
+
+    # Warn when allocation lags behind Uber (charts carry forward last alloc day)
+    try:
+        alloc_preview, _ = cached_allocation(fp)
+        alloc_max = (
+            pd.Timestamp(alloc_preview["Date"].max()).strftime("%Y-%m-%d")
+            if alloc_preview is not None
+            and not alloc_preview.empty
+            and "Date" in alloc_preview.columns
+            else ""
+        )
+    except Exception:
+        alloc_max = ""
+    if alloc_max and uber_max and alloc_max < uber_max:
+        st.caption(
+            f"Ageing / Revenue charts through **{trend_end}** · "
+            f"Allocation Status last day **{alloc_max}** (carried forward for newer days) · "
+            f"Uber through **{uber_max}**. Update Current Vehicle Allocation Sheet for exact day fleet."
+        )
 
     left, right = st.columns(2)
     with left:
