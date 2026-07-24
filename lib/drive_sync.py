@@ -360,7 +360,8 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
     """
     Call at app start / Refresh.
     Local without secrets → local folders.
-    Cloud: always refresh Partner/Pan India sheets, then sync Uber/OLA/GPS/Rapido
+    Cloud: always refresh Partner / Pan India / Current Vehicle Allocation
+    Google Sheets (service account → xlsx), then sync Uber/OLA/GPS/Rapido
     incrementally (only new or changed files by Drive modifiedTime).
     force=True re-downloads every file (slow — Settings only).
     """
@@ -392,7 +393,7 @@ def ensure_data_ready(*, force: bool = False, show_status: bool = True) -> dict:
             import streamlit as st
 
             with st.status("Starting dashboard…", expanded=True) as status:
-                st.write("Refreshing Partner + Pan India…")
+                st.write("Refreshing Partner + Pan India + Current Allocation sheets…")
                 form_sync = sync_allocation_form_sheets(force=True)
                 if form_sync.get("synced"):
                     st.write("Sheets: " + ", ".join(form_sync["synced"]))
@@ -433,10 +434,12 @@ def sync_named_sheet_from_drive(
     name_hint: str,
     dest_name: str,
     force: bool = False,
+    folder_name_hint: str = "allocation",
+    dest_subdir: str = "Allocation & Drop off form",
 ) -> dict:
     """
-    Find a Google Sheet under AI Dashboard → Allocation & Drop off form
-    and export it to .data_cache (or data_root) as XLSX.
+    Find a Google Sheet under AI Dashboard → folder matching folder_name_hint
+    and export it to .data_cache as XLSX.
     User never exports Excel — service account does it.
     """
     if not drive_configured():
@@ -456,15 +459,30 @@ def sync_named_sheet_from_drive(
         service = _drive_service()
         top = _list_children(service, root_id)
         form_folder = None
+        folder_hint = folder_name_hint.strip().casefold()
         for item in top:
             name = (item.get("name") or "").strip().casefold()
-            if _is_folder(item) and "allocation" in name and "drop" in name:
+            if not _is_folder(item):
+                continue
+            # Prefer folders whose name contains all significant words from hint
+            words = [w for w in folder_hint.replace("&", " ").split() if len(w) > 2]
+            if words and all(w in name for w in words):
                 form_folder = item
                 break
+            if folder_hint and folder_hint in name:
+                form_folder = item
+                break
+        # Fallback: Allocation & Drop off form (legacy Partner / Pan India)
+        if not form_folder and "allocation" in folder_hint:
+            for item in top:
+                name = (item.get("name") or "").strip().casefold()
+                if _is_folder(item) and "allocation" in name and "drop" in name:
+                    form_folder = item
+                    break
         if not form_folder:
             return {
                 "ok": False,
-                "message": "Allocation & Drop off form folder not found on Drive",
+                "message": f"Drive folder matching '{folder_name_hint}' not found",
                 "path": "",
                 "bytes": 0,
             }
@@ -486,7 +504,7 @@ def sync_named_sheet_from_drive(
             }
 
         dest_root = cache_dir()
-        dest = dest_root / "Allocation & Drop off form" / dest_name
+        dest = dest_root / dest_subdir / dest_name
         meta_path = dest_root / META_NAME
         meta = _load_meta(meta_path)
         key = sheet_item["id"]
@@ -534,15 +552,40 @@ def sync_named_sheet_from_drive(
 
 
 def sync_allocation_form_sheets(*, force: bool = False) -> dict:
-    """Auto-sync Partner Details + Pan India Allocation Google Sheets."""
+    """Auto-sync live Google Sheets → xlsx (service account; never manual Excel).
+
+    - Partner Details + Pan India (Allocation & Drop off form)
+    - Current Vehicle Allocation Sheet (Vehicle Allocation Status)
+    """
     results = {}
     synced = []
-    for hint, dest in (
-        ("partner details", "Partner Details.xlsx"),
-        ("pan india allocation", "Pan India Allocation.xlsx"),
-    ):
+    jobs = (
+        (
+            "partner details",
+            "Partner Details.xlsx",
+            "allocation drop",
+            "Allocation & Drop off form",
+        ),
+        (
+            "pan india allocation",
+            "Pan India Allocation.xlsx",
+            "allocation drop",
+            "Allocation & Drop off form",
+        ),
+        (
+            "current vehicle allocation",
+            "Current Vehicle Allocation Sheet.xlsx",
+            "vehicle allocation status",
+            "Vehicle Allocation Status",
+        ),
+    )
+    for hint, dest, folder_hint, subdir in jobs:
         info = sync_named_sheet_from_drive(
-            name_hint=hint, dest_name=dest, force=force
+            name_hint=hint,
+            dest_name=dest,
+            force=force,
+            folder_name_hint=folder_hint,
+            dest_subdir=subdir,
         )
         results[hint] = info
         if info.get("ok"):

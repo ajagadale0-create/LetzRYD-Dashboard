@@ -231,8 +231,9 @@ def _alloc_snapshot_for_day(
 ) -> pd.DataFrame:
     """Allocation rows for ``day``; if missing, carry forward last prior day.
 
-    Current Vehicle Allocation Status often lags Uber/OLA by a few days.
-    Without this, Ageing / Revenue charts show blank for those lag days.
+    Current Vehicle Allocation Status Google Sheet is auto-exported to xlsx.
+    If that export lags Uber/OLA by a few days, carry forward last prior day
+    so Ageing / Revenue charts stay visible (never ask ops to edit Excel).
     """
     if alloc is None or alloc.empty or "Date" not in alloc.columns:
         return pd.DataFrame()

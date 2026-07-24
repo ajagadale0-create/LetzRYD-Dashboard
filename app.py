@@ -274,7 +274,7 @@ def _clear_caches_and_reload(*, message: str = "Cache cleared — data reloading
 
 
 def current_data_fingerprint() -> str:
-    parts = ["v56-charts-alloc-carry-forward", source_fingerprint(uber_root())]
+    parts = ["v57-autosync-current-alloc-sheet", source_fingerprint(uber_root())]
     # Bumped by Clear cache / Refresh so rebuild is forced even if files unchanged
     try:
         parts.append(f"nonce:{int(st.session_state.get('cache_nonce', 0))}")
@@ -2129,9 +2129,10 @@ def _render_dashboard(fp: str, available_dates: list[str]) -> None:
         alloc_max = ""
     if alloc_max and uber_max and alloc_max < uber_max:
         st.caption(
-            f"Ageing / Revenue charts through **{trend_end}** · "
-            f"Allocation Status last day **{alloc_max}** (carried forward for newer days) · "
-            f"Uber through **{uber_max}**. Update Current Vehicle Allocation Sheet for exact day fleet."
+            f"Ageing / Revenue through **{trend_end}** · "
+            f"Current Allocation sheet last day **{alloc_max}** "
+            f"(auto-synced from Google Sheet; carried forward until sheet has newer days) · "
+            f"Uber through **{uber_max}**"
         )
 
     left, right = st.columns(2)
